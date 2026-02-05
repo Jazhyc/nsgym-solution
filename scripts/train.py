@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import logging
 import os
+import warnings
 from pathlib import Path
 
 import hydra
@@ -28,15 +29,16 @@ from tqdm import tqdm
 
 import wandb
 
+# Suppress FutureWarnings from torchrl (Python 3.13 compatibility issues)
+warnings.filterwarnings("ignore", category=FutureWarning, module="torchrl.modules.mcts.scores")
+
 # TorchRL imports
-from torchrl.collectors import SyncDataCollector
-from torchrl.data.replay_buffers import ReplayBuffer
-from torchrl.data.replay_buffers.samplers import SamplerWithoutReplacement
-from torchrl.data.replay_buffers.storages import LazyTensorStorage
+from torchrl.collectors import MultiAsyncCollector
 from torchrl.envs import (
     Compose,
     DoubleToFloat,
     ObservationNorm,
+    ParallelEnv,
     StepCounter,
     TransformedEnv,
 )
@@ -56,26 +58,68 @@ load_dotenv()
 # Environment factory
 # ---------------------------------------------------------------------------
 
-def make_env(cfg: DictConfig, device: torch.device) -> TransformedEnv:
-    """Create a TorchRL ``TransformedEnv`` from Hydra config."""
+def make_single_env(cfg: DictConfig, device: torch.device, obs_norm_state: dict | None = None) -> TransformedEnv:
+    """Create a single TorchRL ``TransformedEnv`` instance.
+    
+    Args:
+        cfg: Hydra config.
+        device: Device for the environment.
+        obs_norm_state: Optional pre-computed observation normalization stats (loc, scale).
+    """
     base_env = GymEnv(cfg.env.id, device=device)
 
     transforms = []
     if cfg.env.normalize_obs:
-        transforms.append(ObservationNorm(in_keys=["observation"]))
+        obs_norm = ObservationNorm(in_keys=["observation"])
+        if obs_norm_state is not None:
+            obs_norm.loc = obs_norm_state["loc"]
+            obs_norm.scale = obs_norm_state["scale"]
+        transforms.append(obs_norm)
     transforms.append(DoubleToFloat())
     transforms.append(StepCounter())
 
     env = TransformedEnv(base_env, Compose(*transforms))
+    return env
 
-    # Initialise observation normalisation stats with random rollouts
-    if cfg.env.normalize_obs:
-        env.transform[0].init_stats(
+
+def make_parallel_env(cfg: DictConfig, device: torch.device, num_envs: int = 1) -> TransformedEnv | ParallelEnv:
+    """Create vectorized parallel environments."""
+    from functools import partial
+    
+    obs_norm_state = None
+    
+    # If using observation normalization, compute stats from a single env first
+    if cfg.env.normalize_obs and num_envs > 1:
+        log.info("Initializing observation normalization stats...")
+        temp_env = make_single_env(cfg, device, obs_norm_state=None)
+        temp_env.transform[0].init_stats(
             num_iter=cfg.env.normalize_obs_init_steps,
             reduce_dim=0,
             cat_dim=0,
         )
-
+        obs_norm_state = {
+            "loc": temp_env.transform[0].loc.clone(),
+            "scale": temp_env.transform[0].scale.clone(),
+        }
+        temp_env.close()
+        log.info("Observation normalization stats initialized.")
+    
+    if num_envs == 1:
+        env = make_single_env(cfg, device, obs_norm_state=obs_norm_state)
+        if cfg.env.normalize_obs:
+            env.transform[0].init_stats(
+                num_iter=cfg.env.normalize_obs_init_steps,
+                reduce_dim=0,
+                cat_dim=0,
+            )
+    else:
+        # Use functools.partial instead of lambda for proper serialization
+        env = ParallelEnv(
+            num_workers=num_envs,
+            create_env_fn=partial(make_single_env, cfg, device, obs_norm_state),
+            serial_for_single=True,
+        )
+    
     return env
 
 
@@ -117,8 +161,9 @@ def train(cfg: DictConfig) -> None:
     log.info("wandb %s", "enabled" if cfg.wandb.enabled else "disabled")
 
     # ── Environment ────────────────────────────────────────────────────
-    env = make_env(cfg, device)
-    log.info("Env: %s | obs=%s  act=%s", cfg.env.id,
+    num_envs = cfg.collector.num_envs
+    env = make_parallel_env(cfg, device, num_envs=num_envs)
+    log.info("Env: %s | num_envs=%d | obs=%s  act=%s", cfg.env.id, num_envs,
              env.observation_spec["observation"].shape,
              env.action_spec.shape)
 
@@ -131,19 +176,12 @@ def train(cfg: DictConfig) -> None:
     scheduler = models["scheduler"]
 
     # ── Data collector ─────────────────────────────────────────────────
-    collector = SyncDataCollector(
-        env,
+    collector = MultiAsyncCollector(
+        [env],
         actor,
         frames_per_batch=cfg.collector.frames_per_batch,
         total_frames=cfg.collector.total_frames,
-        split_trajs=False,
         device=device,
-    )
-
-    # ── Replay buffer ──────────────────────────────────────────────────
-    replay_buffer = ReplayBuffer(
-        storage=LazyTensorStorage(max_size=cfg.collector.frames_per_batch),
-        sampler=SamplerWithoutReplacement(),
     )
 
     # ── Checkpoint directory ───────────────────────────────────────────
@@ -172,13 +210,16 @@ def train(cfg: DictConfig) -> None:
             # Recompute advantage each epoch (value net is being updated)
             advantage_module(tensordict_data)
 
+            # Flatten the data and create random permutation for mini-batch sampling
             data_view = tensordict_data.reshape(-1)
-            replay_buffer.extend(data_view.cpu())
-
+            perm = torch.randperm(data_view.batch_size[0], device=device)
+            
             n_sub = cfg.collector.frames_per_batch // cfg.training.sub_batch_size
-            for _ in range(n_sub):
-                subdata = replay_buffer.sample(cfg.training.sub_batch_size)
-                loss_vals = loss_module(subdata.to(device))
+            for i in range(n_sub):
+                # Sample mini-batch indices
+                idx = perm[i * cfg.training.sub_batch_size : (i + 1) * cfg.training.sub_batch_size]
+                subdata = data_view[idx]
+                loss_vals = loss_module(subdata)
 
                 loss_total = (
                     loss_vals["loss_objective"]
