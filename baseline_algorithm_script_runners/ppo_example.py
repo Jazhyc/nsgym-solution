@@ -2,7 +2,7 @@
 
 from pathlib import Path
 from stable_baselines3 import PPO
-from stable_baselines3.common.vec_env import DummyVecEnv, VecNormalize
+from stable_baselines3.common.vec_env import DummyVecEnv, SubprocVecEnv, VecNormalize
 from AAMAS_Comp.examples.agents import AAMASCompBaselinePPO
 from AAMAS_Comp.evaluation import run_complete_evaluation
 import gymnasium as gym
@@ -10,9 +10,10 @@ import gymnasium as gym
 
 MODELS_DIR = Path("models")
 RESULTS_DIR = Path("results")
+NUM_ENVS = 8
 
 
-def train(total_timesteps=1_000_000, save_dir=MODELS_DIR, name_prefix="ppo_ant"):
+def train(total_timesteps=100_000, save_dir=MODELS_DIR, name_prefix="ppo_ant"):
     """Train PPO on the stationary Ant-v5 environment.
 
     Args:
@@ -25,7 +26,7 @@ def train(total_timesteps=1_000_000, save_dir=MODELS_DIR, name_prefix="ppo_ant")
         save_path = save_dir / name_prefix
 
     # Tuned hyperparameters from RL Zoo3 for Ant
-    vec_env = DummyVecEnv([lambda: gym.make("Ant-v5")])
+    vec_env = SubprocVecEnv([lambda: gym.make("Ant-v5") for _ in range(NUM_ENVS)])
     env = VecNormalize(vec_env)
 
     model = PPO(
@@ -42,6 +43,7 @@ def train(total_timesteps=1_000_000, save_dir=MODELS_DIR, name_prefix="ppo_ant")
         max_grad_norm=0.6,
         vf_coef=0.677239,
         verbose=1,
+        device="cpu",
     )
     model.learn(total_timesteps=total_timesteps)
 

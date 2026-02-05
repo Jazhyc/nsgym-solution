@@ -1,0 +1,47 @@
+# ── Top-level Hydra config ──────────────────────────────────────────────
+defaults:
+  - agent: ppo
+  - env: ant
+  - _self_
+  - override hydra/job_logging: colorlog
+  - override hydra/hydra_logging: colorlog
+
+hydra:
+  run:
+    dir: logs/runs/${now:%Y-%m-%d}/${now:%H-%M-%S}
+  sweep:
+    dir: logs/multirun/${now:%Y-%m-%d}/${now:%H-%M-%S}
+    subdir: ${hydra.job.num}
+
+# ── Data collection ────────────────────────────────────────────────────
+collector:
+  total_frames: 1_000_000
+  frames_per_batch: 2048
+  max_frames_per_traj: 1000
+
+# ── Training loop ──────────────────────────────────────────────────────
+training:
+  num_epochs: 10              # inner PPO optimisation epochs per batch
+  sub_batch_size: 64          # mini-batch size inside each epoch
+  max_grad_norm: 1.0
+  eval_interval: 10           # evaluate every N collector iterations
+  eval_rollout_steps: 1000
+  save_interval: 50           # save checkpoint every N collector iterations
+  checkpoint_dir: logs/checkpoints
+
+# ── Reproducibility ────────────────────────────────────────────────────
+seed: 42
+
+# ── Device ─────────────────────────────────────────────────────────────
+device: auto                  # "auto" -> cuda if available else cpu
+
+# ── Weights & Biases ───────────────────────────────────────────────────
+wandb:
+  enabled: true
+  project: aamas-ppo
+  entity: null                # set to your wandb team / username
+  group: null
+  name: null                  # auto-generated if null
+  tags: []
+  mode: online                # online | offline | disabled
+  dir: logs/wandb             # local directory for wandb logs

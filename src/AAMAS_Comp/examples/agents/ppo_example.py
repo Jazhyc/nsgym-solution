@@ -21,9 +21,9 @@ class AAMASCompBaselinePPO(SB3Agent):
         vec_normalize: A VecNormalize instance for observation normalization.
     """
 
-    def __init__(self, model_path=None, model=None, deterministic=True, vec_normalize=None) -> None:
+    def __init__(self, model_path=None, model=None, deterministic=True, vec_normalize=None, device="cpu") -> None:
         if model is None and model_path is None:
             raise ValueError("Provide either model or model_path")
         if model is None:
-            model = PPO.load(model_path)
+            model = PPO.load(model_path, device=device)
         super().__init__(model=model, deterministic=deterministic, vec_normalize=vec_normalize)
