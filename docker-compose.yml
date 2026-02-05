@@ -1,0 +1,34 @@
+services:
+  base:
+    platform: linux/amd64
+    build:
+      context: .
+      dockerfile: docker/base.Dockerfile
+    image: ns-gym-base
+
+  dev:
+    platform: linux/amd64
+    build:
+      context: .
+      dockerfile: docker/eval.Dockerfile
+    volumes:
+      - .:/comp
+    mem_limit: 32g
+    memswap_limit: 32g
+    command: /bin/bash
+
+  test-submission:
+    platform: linux/amd64
+    build:
+      context: .
+      dockerfile: docker/eval.Dockerfile
+    volumes:
+      - ./submission.py:/comp/submission.py
+      - ./example_submission.py:/comp/example_submission.py
+      - ./evaluator.py:/comp/evaluator.py
+      - ./src:/comp/src
+      - ./models:/comp/models
+      - ./results:/comp/results
+    mem_limit: 32g
+    memswap_limit: 32g
+    command: ["uv", "run", "python", "evaluator.py", "--mode", "local"]
