@@ -99,19 +99,30 @@ def make_ppo_models(
     env: EnvBase,
     cfg: DictConfig,
     device: torch.device | str = "cpu",
+    network_device: torch.device | str | None = None,
 ) -> dict:
     """Construct actor, critic, advantage estimator, loss, and optimizer.
 
     Args:
         env: A TorchRL environment (used for specs).
         cfg: Flat Hydra config that must contain the keys listed in
-            ``scripts/configs/``.
-        device: Device for all modules.
+            ``config/``.
+        device: Device for environment/collector (used for data transfers).
+        network_device: Device for neural networks. Defaults to ``device``
+            if not specified, or uses ``cfg.agent.network_device`` if available.
 
     Returns:
         Dictionary with keys ``actor``, ``critic``, ``advantage``,
         ``loss_module``, ``optimizer``, ``scheduler``.
     """
+    if network_device is None:
+        # Try to get from config, otherwise default to device
+        if hasattr(cfg, "agent") and hasattr(cfg.agent, "network_device"):
+            network_device = cfg.agent.network_device
+        else:
+            network_device = device
+    
+    network_device = torch.device(network_device) if isinstance(network_device, str) else network_device
     obs_dim = env.observation_spec["observation"].shape[-1]
     act_dim = env.action_spec.shape[-1]
     hidden_sizes = list(cfg.agent.hidden_sizes)
@@ -122,7 +133,7 @@ def make_ppo_models(
         act_dim=act_dim,
         hidden_sizes=hidden_sizes,
         activation=activation,
-        device=device,
+        device=network_device,
         action_spec=env.action_spec_unbatched,
     )
 
@@ -130,7 +141,7 @@ def make_ppo_models(
         obs_dim=obs_dim,
         hidden_sizes=hidden_sizes,
         activation=activation,
-        device=device,
+        device=network_device,
     )
 
     # -- Advantage estimation (GAE) ------------------------------------------

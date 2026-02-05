@@ -141,8 +141,13 @@ def resolve_device(device_str: str) -> torch.device:
 def train(cfg: DictConfig) -> None:
     # ── Resolve device & seed ──────────────────────────────────────────
     device = resolve_device(cfg.device)
+    # Network device defaults to same as device if set to "auto"
+    if hasattr(cfg.agent, "network_device") and cfg.agent.network_device != "auto":
+        network_device = resolve_device(cfg.agent.network_device)
+    else:
+        network_device = device
     torch.manual_seed(cfg.seed)
-    log.info(f"Device: {device} | Seed: {cfg.seed}")
+    log.info(f"Device: {device} | Network Device: {network_device} | Seed: {cfg.seed}")
     log.info(f"Config:\n{OmegaConf.to_yaml(cfg)}")
 
     # ── Weights & Biases ───────────────────────────────────────────────
@@ -168,7 +173,7 @@ def train(cfg: DictConfig) -> None:
              env.action_spec.shape)
 
     # ── Build PPO modules ──────────────────────────────────────────────
-    models = make_ppo_models(env, cfg, device=device)
+    models = make_ppo_models(env, cfg, device=device, network_device=network_device)
     actor = models["actor"]
     advantage_module = models["advantage"]
     loss_module = models["loss_module"]
@@ -296,6 +301,7 @@ def train(cfg: DictConfig) -> None:
 
     pbar.close()
     collector.shutdown()
+    env.close()
 
     # ── Final save ─────────────────────────────────────────────────────
     final_path = ckpt_dir / "ppo_final.pt"

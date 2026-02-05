@@ -14,9 +14,9 @@ hydra:
 # ── Data collection ────────────────────────────────────────────────────
 collector:
   num_envs: 4                 # number of parallel environments
-  total_frames: 100_000
-  frames_per_batch: 2048
-  max_frames_per_traj: 1000
+  total_frames: 100_000       # total frames to collect across all training
+  frames_per_batch: 2048      # frames to collect before each training epoch (data collection iteration)
+  max_frames_per_traj: 1000   # max steps per episode before truncation (env horizon)
 
 # ── Training loop ──────────────────────────────────────────────────────
 training:
@@ -24,15 +24,15 @@ training:
   sub_batch_size: 64          # mini-batch size inside each epoch
   max_grad_norm: 1.0
   eval_interval: 10           # evaluate every N collector iterations
-  eval_rollout_steps: 1000
+  eval_rollout_steps: 1000    # steps to run during evaluation (deterministic policy, no training)
   save_interval: 50           # save checkpoint every N collector iterations
-  checkpoint_dir: logs/checkpoints
+  checkpoint_dir: checkpoints
 
 # ── Reproducibility ────────────────────────────────────────────────────
 seed: 42
 
 # ── Device ─────────────────────────────────────────────────────────────
-device: auto                  # "auto" -> cuda if available else cpu
+device: cpu                   # device for collector/env (cpu | cuda | auto)
 
 # ── Weights & Biases ───────────────────────────────────────────────────
 wandb:

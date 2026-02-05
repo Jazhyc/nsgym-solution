@@ -9,5 +9,6 @@ critic_coeff: 1.0
 loss_critic_type: smooth_l1   # smooth_l1 | l2
 
 # ── Network architecture ───────────────────────────────────────────────
-hidden_sizes: [256, 256]
+hidden_sizes: [64, 64]
 activation: Tanh              # any torch.nn activation class name
+network_device: cpu           # device for neural networks (cpu | cuda | auto)
