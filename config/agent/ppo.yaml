@@ -12,3 +12,8 @@ loss_critic_type: smooth_l1   # smooth_l1 | l2
 hidden_sizes: [64, 64]
 activation: Tanh              # any torch.nn activation class name
 network_device: cpu           # device for neural networks (cpu | cuda | auto)
+
+# ── Performance optimizations ──────────────────────────────────────────
+compile: true                # use torch.compile for faster training (PyTorch 2.0+)
+compile_mode: default        # default | reduce-overhead | max-autotune
+dtype: float32               # network dtype: float32 | float16 | bfloat16 (float16/bfloat16 only beneficial on GPU)

@@ -10,6 +10,7 @@ Provides:
 
 from __future__ import annotations
 
+import logging
 from typing import Any, Dict, Sequence
 
 import numpy as np
@@ -27,6 +28,8 @@ from torchrl.objectives.value import GAE
 from AAMAS_Comp.agents.networks import make_mlp
 from AAMAS_Comp.base_agent import ModelFreeAgent
 
+log = logging.getLogger(__name__)
+
 
 # ---------------------------------------------------------------------------
 # Model factories
@@ -39,22 +42,25 @@ def make_actor(
     activation: str,
     device: torch.device | str,
     action_spec: Any | None = None,
+    dtype: torch.dtype | None = None,
 ) -> ProbabilisticActor:
     """Build a stochastic Gaussian actor wrapped as a ``ProbabilisticActor``.
 
     The underlying network outputs ``(loc, scale)`` which are consumed by
     a ``TanhNormal`` distribution that respects action-space bounds.
     """
-    net = nn.Sequential(
-        make_mlp(
-            in_features=obs_dim,
-            out_features=2 * act_dim,
-            hidden_sizes=hidden_sizes,
-            activation=activation,
-            device=device,
-        ),
-        NormalParamExtractor(),
+    # Create MLP and convert to dtype BEFORE wrapping in Sequential with NormalParamExtractor
+    mlp = make_mlp(
+        in_features=obs_dim,
+        out_features=2 * act_dim,
+        hidden_sizes=hidden_sizes,
+        activation=activation,
+        device=device,
+        dtype=dtype,
     )
+    
+    # Wrap with NormalParamExtractor after dtype conversion
+    net = nn.Sequential(mlp, NormalParamExtractor())
 
     policy_module = TensorDictModule(
         net,
@@ -75,6 +81,7 @@ def make_actor(
         distribution_kwargs=dist_kwargs,
         return_log_prob=True,
     )
+    
     return actor
 
 
@@ -83,6 +90,7 @@ def make_critic(
     hidden_sizes: Sequence[int],
     activation: str,
     device: torch.device | str,
+    dtype: torch.dtype | None = None,
 ) -> ValueOperator:
     """Build a state-value critic ``V(s)``."""
     net = make_mlp(
@@ -91,8 +99,11 @@ def make_critic(
         hidden_sizes=hidden_sizes,
         activation=activation,
         device=device,
+        dtype=dtype,
     )
-    return ValueOperator(module=net, in_keys=["observation"])
+    critic = ValueOperator(module=net, in_keys=["observation"])
+    
+    return critic
 
 
 def make_ppo_models(
@@ -100,6 +111,7 @@ def make_ppo_models(
     cfg: DictConfig,
     device: torch.device | str = "cpu",
     network_device: torch.device | str | None = None,
+    dtype: torch.dtype | None = None,
 ) -> dict:
     """Construct actor, critic, advantage estimator, loss, and optimizer.
 
@@ -110,6 +122,7 @@ def make_ppo_models(
         device: Device for environment/collector (used for data transfers).
         network_device: Device for neural networks. Defaults to ``device``
             if not specified, or uses ``cfg.agent.network_device`` if available.
+        dtype: Optional dtype for network parameters (e.g., torch.bfloat16).
 
     Returns:
         Dictionary with keys ``actor``, ``critic``, ``advantage``,
@@ -135,6 +148,7 @@ def make_ppo_models(
         activation=activation,
         device=network_device,
         action_spec=env.action_spec_unbatched,
+        dtype=dtype,
     )
 
     critic = make_critic(
@@ -142,7 +156,20 @@ def make_ppo_models(
         hidden_sizes=hidden_sizes,
         activation=activation,
         device=network_device,
+        dtype=dtype,
     )
+
+    # -- Apply torch.compile if enabled -------------------------------------
+    # Compile the underlying neural network modules BEFORE creating loss module
+    # This ensures the loss module captures the compiled versions
+    if cfg.agent.get("compile", False):
+        log.info("Compiling network modules with torch.compile...")
+        compile_mode = cfg.agent.get("compile_mode", "default")
+        # Compile the underlying Sequential modules, not the TensorDictModule wrappers
+        # Structure is: actor.module (TensorDictModule) -> [0] (Sequential with MLP + NormalParamExtractor)
+        actor.module[0] = torch.compile(actor.module[0], mode=compile_mode)
+        # Critic has ValueOperator wrapping TensorDictModule wrapping the MLP
+        critic.module = torch.compile(critic.module, mode=compile_mode)
 
     # -- Advantage estimation (GAE) ------------------------------------------
     advantage = GAE(

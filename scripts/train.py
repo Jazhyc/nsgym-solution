@@ -58,13 +58,14 @@ load_dotenv()
 # Environment factory
 # ---------------------------------------------------------------------------
 
-def make_single_env(cfg: DictConfig, device: torch.device, obs_norm_state: dict | None = None) -> TransformedEnv:
+def make_single_env(cfg: DictConfig, device: torch.device, obs_norm_state: dict | None = None, dtype: torch.dtype | None = None) -> TransformedEnv:
     """Create a single TorchRL ``TransformedEnv`` instance.
     
     Args:
         cfg: Hydra config.
         device: Device for the environment.
         obs_norm_state: Optional pre-computed observation normalization stats (loc, scale).
+        dtype: Optional dtype to cast observations to (e.g., torch.bfloat16).
     """
     base_env = GymEnv(cfg.env.id, device=device)
 
@@ -76,13 +77,20 @@ def make_single_env(cfg: DictConfig, device: torch.device, obs_norm_state: dict 
             obs_norm.scale = obs_norm_state["scale"]
         transforms.append(obs_norm)
     transforms.append(DoubleToFloat())
+    
+    # Add dtype casting if specified (e.g., for bfloat16 networks)
+    # Observations are float32 after DoubleToFloat, so convert from float32 to target dtype
+    if dtype is not None and dtype != torch.float32:
+        from torchrl.envs import DTypeCastTransform
+        transforms.append(DTypeCastTransform(dtype_in=torch.float32, dtype_out=dtype, in_keys=["observation"]))
+    
     transforms.append(StepCounter())
 
     env = TransformedEnv(base_env, Compose(*transforms))
     return env
 
 
-def make_parallel_env(cfg: DictConfig, device: torch.device, num_envs: int = 1) -> TransformedEnv | ParallelEnv:
+def make_parallel_env(cfg: DictConfig, device: torch.device, num_envs: int = 1, dtype: torch.dtype | None = None) -> TransformedEnv | ParallelEnv:
     """Create vectorized parallel environments."""
     from functools import partial
     
@@ -91,7 +99,7 @@ def make_parallel_env(cfg: DictConfig, device: torch.device, num_envs: int = 1) 
     # If using observation normalization, compute stats from a single env first
     if cfg.env.normalize_obs and num_envs > 1:
         log.info("Initializing observation normalization stats...")
-        temp_env = make_single_env(cfg, device, obs_norm_state=None)
+        temp_env = make_single_env(cfg, device, obs_norm_state=None, dtype=dtype)
         temp_env.transform[0].init_stats(
             num_iter=cfg.env.normalize_obs_init_steps,
             reduce_dim=0,
@@ -105,7 +113,7 @@ def make_parallel_env(cfg: DictConfig, device: torch.device, num_envs: int = 1) 
         log.info("Observation normalization stats initialized.")
     
     if num_envs == 1:
-        env = make_single_env(cfg, device, obs_norm_state=obs_norm_state)
+        env = make_single_env(cfg, device, obs_norm_state=obs_norm_state, dtype=dtype)
         if cfg.env.normalize_obs:
             env.transform[0].init_stats(
                 num_iter=cfg.env.normalize_obs_init_steps,
@@ -116,7 +124,7 @@ def make_parallel_env(cfg: DictConfig, device: torch.device, num_envs: int = 1) 
         # Use functools.partial instead of lambda for proper serialization
         env = ParallelEnv(
             num_workers=num_envs,
-            create_env_fn=partial(make_single_env, cfg, device, obs_norm_state),
+            create_env_fn=partial(make_single_env, cfg, device, obs_norm_state, dtype),
             serial_for_single=True,
         )
     
@@ -167,19 +175,31 @@ def train(cfg: DictConfig) -> None:
 
     # ── Environment ────────────────────────────────────────────────────
     num_envs = cfg.collector.num_envs
-    env = make_parallel_env(cfg, device, num_envs=num_envs)
+    
+    # Determine network dtype early
+    dtype_str = cfg.agent.get("dtype", "float32")
+    dtype_map = {
+        "float32": None,  # None means use default float32
+        "float16": torch.float16,
+        "bfloat16": torch.bfloat16,
+    }
+    network_dtype = dtype_map.get(dtype_str, None)
+    if network_dtype is not None:
+        log.info(f"Creating networks and observations in dtype: {network_dtype}")
+    
+    env = make_parallel_env(cfg, device, num_envs=num_envs, dtype=network_dtype)
     log.info("Env: %s | num_envs=%d | obs=%s  act=%s", cfg.env.id, num_envs,
              env.observation_spec["observation"].shape,
              env.action_spec.shape)
 
     # ── Build PPO modules ──────────────────────────────────────────────
-    models = make_ppo_models(env, cfg, device=device, network_device=network_device)
+    models = make_ppo_models(env, cfg, device=device, network_device=network_device, dtype=network_dtype)
     actor = models["actor"]
     advantage_module = models["advantage"]
     loss_module = models["loss_module"]
     optimizer = models["optimizer"]
     scheduler = models["scheduler"]
-
+    
     # ── Data collector ─────────────────────────────────────────────────
     collector = MultiAsyncCollector(
         [env],
@@ -224,8 +244,8 @@ def train(cfg: DictConfig) -> None:
                 # Sample mini-batch indices
                 idx = perm[i * cfg.training.sub_batch_size : (i + 1) * cfg.training.sub_batch_size]
                 subdata = data_view[idx]
+                
                 loss_vals = loss_module(subdata)
-
                 loss_total = (
                     loss_vals["loss_objective"]
                     + loss_vals["loss_critic"]

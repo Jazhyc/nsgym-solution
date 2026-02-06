@@ -19,6 +19,7 @@ def make_mlp(
     activation: str = "Tanh",
     output_activation: str | None = None,
     device: torch.device | str = "cpu",
+    dtype: torch.dtype | None = None,
 ) -> nn.Sequential:
     """Build a simple MLP.
 
@@ -29,6 +30,7 @@ def make_mlp(
         activation: Name of the activation function (from ``torch.nn``).
         output_activation: Optional activation after the final layer.
         device: Device to place the module on.
+        dtype: Optional dtype for network parameters.
 
     Returns:
         A ``nn.Sequential`` MLP.
@@ -47,4 +49,10 @@ def make_mlp(
     if output_activation is not None:
         layers.append(getattr(nn, output_activation)())
 
-    return nn.Sequential(*layers)
+    net = nn.Sequential(*layers)
+    
+    # Convert to target dtype after construction if specified
+    if dtype is not None:
+        net = net.to(dtype=dtype)
+    
+    return net
