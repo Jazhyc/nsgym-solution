@@ -7,6 +7,7 @@ clip_epsilon: 0.2
 entropy_coeff: 1.0e-4
 critic_coeff: 1.0
 loss_critic_type: smooth_l1   # smooth_l1 | l2
+optimizer: rmsprop              # optimizer: adamw | rmsprop | muon | muon_adamw
 
 # ── Network architecture ───────────────────────────────────────────────
 hidden_sizes: [64, 64]

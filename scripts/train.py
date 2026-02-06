@@ -306,11 +306,10 @@ def train(cfg: DictConfig) -> None:
             wandb.log(metrics, step=global_step)
 
         pbar.update(batch_frames)
-        pbar.set_postfix(
-            reward=f"{mean_reward:.3f}",
-            steps=max_step_count,
-            lr=f"{lr_now:.2e}",
-        )
+        postfix = dict(reward=f"{mean_reward:.3f}")
+        if collect_iter % cfg.training.eval_interval == 0:
+            postfix["eval_return"] = f"{eval_reward_sum:.2f}"
+        pbar.set_postfix(postfix)
 
         # ── Checkpointing ─────────────────────────────────────────────
         if collect_iter % cfg.training.save_interval == 0 and collect_iter > 0:

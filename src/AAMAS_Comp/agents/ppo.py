@@ -191,7 +191,58 @@ def make_ppo_models(
     )
 
     # -- Optimizer & LR scheduler ---------------------------------------------
-    optimizer = torch.optim.Adam(loss_module.parameters(), lr=cfg.agent.lr)
+    # Muon only supports 2D parameters, so we separate them
+    params_2d = [p for p in loss_module.parameters() if p.dim() >= 2]
+    params_1d = [p for p in loss_module.parameters() if p.dim() < 2]
+    
+    # Create separate optimizers for 2D and 1D parameters
+    class CombinedOptimizer(torch.optim.Optimizer):
+        """Wrapper to handle both Muon (2D) and AdamW (1D) optimizers together."""
+        def __init__(self, muon_opt, adamw_opt):
+            self.muon_opt = muon_opt
+            self.adamw_opt = adamw_opt
+            # Combine param groups from both optimizers
+            self.param_groups = muon_opt.param_groups + adamw_opt.param_groups
+            self.defaults = {}
+            self._step = self._create_step()
+        
+        def _create_step(self):
+            """Create the compiled step function."""
+            def step_fn():
+                self.muon_opt.step()
+                self.adamw_opt.step()
+            return torch.compile(step_fn, backend="eager")
+        
+        def step(self, closure=None):
+            self._step()
+        
+        def zero_grad(self, set_to_none=False):
+            self.muon_opt.zero_grad(set_to_none=set_to_none)
+            self.adamw_opt.zero_grad(set_to_none=set_to_none)
+    
+    # Create optimizer based on config
+    optimizer_type = cfg.agent.get("optimizer", "adamw").lower()
+    
+    if optimizer_type == "adamw":
+        optimizer = torch.optim.AdamW(loss_module.parameters(), lr=cfg.agent.lr)
+    elif optimizer_type == "rmsprop":
+        optimizer = torch.optim.RMSprop(loss_module.parameters(), lr=cfg.agent.lr)
+    elif optimizer_type == "muon":
+        if not params_2d:
+            raise ValueError("Muon optimizer requires 2D parameters, but none found")
+        optimizer = torch.optim.Muon(params_2d, lr=cfg.agent.lr)
+    elif optimizer_type == "muon_adamw":
+        muon_opt = torch.optim.Muon(params_2d, lr=cfg.agent.lr) if params_2d else None
+        adamw_opt = torch.optim.AdamW(params_1d, lr=cfg.agent.lr) if params_1d else None
+        
+        if muon_opt and adamw_opt:
+            optimizer = CombinedOptimizer(muon_opt, adamw_opt)
+        elif muon_opt:
+            optimizer = muon_opt
+        else:
+            optimizer = adamw_opt
+    else:
+        raise ValueError(f"Unknown optimizer type: {optimizer_type}")
 
     total_iters = cfg.collector.total_frames // cfg.collector.frames_per_batch
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
