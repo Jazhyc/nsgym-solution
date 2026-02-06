@@ -55,6 +55,62 @@ load_dotenv()
 
 
 # ---------------------------------------------------------------------------
+# Running observation normalization
+# ---------------------------------------------------------------------------
+
+class RunningMeanStd:
+    """Welford online running mean / variance tracker.
+
+    Tracks the sufficient statistics (mean, var, count) so that
+    ``ObservationNorm`` transforms can be kept up-to-date as training
+    progresses.
+    """
+
+    def __init__(self, shape: tuple[int, ...] = (), device: torch.device | None = None):
+        self.mean = torch.zeros(shape, device=device)
+        self.var = torch.ones(shape, device=device)
+        self.count: float = 1e-4  # small epsilon to avoid div-by-zero
+
+    def update(self, batch: torch.Tensor) -> None:
+        """Update stats with a new batch of observations ``(N, *shape)``."""
+        batch = batch.reshape(-1, *self.mean.shape).float()
+        batch_mean = batch.mean(dim=0)
+        batch_var = batch.var(dim=0, correction=0)
+        batch_count = batch.shape[0]
+        self._update_from_moments(batch_mean, batch_var, batch_count)
+
+    def _update_from_moments(self, batch_mean: torch.Tensor, batch_var: torch.Tensor, batch_count: int) -> None:
+        delta = batch_mean - self.mean
+        total_count = self.count + batch_count
+        new_mean = self.mean + delta * batch_count / total_count
+        m_a = self.var * self.count
+        m_b = batch_var * batch_count
+        m2 = m_a + m_b + delta.pow(2) * self.count * batch_count / total_count
+        self.mean = new_mean
+        self.var = m2 / total_count
+        self.count = total_count
+
+    @property
+    def std(self) -> torch.Tensor:
+        return torch.sqrt(self.var).clamp(min=1e-6)
+
+    def state_dict(self) -> dict:
+        return {"mean": self.mean.clone(), "var": self.var.clone(), "count": self.count}
+
+    def load_state_dict(self, d: dict) -> None:
+        self.mean = d["mean"]
+        self.var = d["var"]
+        self.count = d["count"]
+
+
+def sync_obs_norm(obs_norm: ObservationNorm, rms: RunningMeanStd) -> None:
+    """Push ``RunningMeanStd`` statistics into an ``ObservationNorm``
+    that uses ``standard_normal=True``."""
+    obs_norm.loc.copy_(rms.mean)
+    obs_norm.scale.copy_(rms.std)
+
+
+# ---------------------------------------------------------------------------
 # Environment factory
 # ---------------------------------------------------------------------------
 
@@ -64,17 +120,19 @@ def make_single_env(cfg: DictConfig, device: torch.device, obs_norm_state: dict 
     Args:
         cfg: Hydra config.
         device: Device for the environment.
-        obs_norm_state: Optional pre-computed observation normalization stats (loc, scale).
+        obs_norm_state: Optional dict with ``mean`` and ``std`` tensors to
+            initialise the ``ObservationNorm`` (``standard_normal=True``).
         dtype: Optional dtype to cast observations to (e.g., torch.bfloat16).
     """
     base_env = GymEnv(cfg.env.id, device=device)
 
     transforms = []
     if cfg.env.normalize_obs:
-        obs_norm = ObservationNorm(in_keys=["observation"])
+        obs_norm = ObservationNorm(in_keys=["observation"], standard_normal=True)
         if obs_norm_state is not None:
-            obs_norm.loc = obs_norm_state["loc"]
-            obs_norm.scale = obs_norm_state["scale"]
+            # Materialise the lazy buffers and fill them
+            obs_norm.loc = torch.nn.Parameter(obs_norm_state["mean"].clone(), requires_grad=False)
+            obs_norm.scale = torch.nn.Parameter(obs_norm_state["std"].clone(), requires_grad=False)
         transforms.append(obs_norm)
     transforms.append(DoubleToFloat())
     
@@ -90,36 +148,12 @@ def make_single_env(cfg: DictConfig, device: torch.device, obs_norm_state: dict 
     return env
 
 
-def make_parallel_env(cfg: DictConfig, device: torch.device, num_envs: int = 1, dtype: torch.dtype | None = None) -> TransformedEnv | ParallelEnv:
+def make_parallel_env(cfg: DictConfig, device: torch.device, num_envs: int = 1, dtype: torch.dtype | None = None, obs_norm_state: dict | None = None) -> TransformedEnv | ParallelEnv:
     """Create vectorized parallel environments."""
     from functools import partial
     
-    obs_norm_state = None
-    
-    # If using observation normalization, compute stats from a single env first
-    if cfg.env.normalize_obs and num_envs > 1:
-        log.info("Initializing observation normalization stats...")
-        temp_env = make_single_env(cfg, device, obs_norm_state=None, dtype=dtype)
-        temp_env.transform[0].init_stats(
-            num_iter=cfg.env.normalize_obs_init_steps,
-            reduce_dim=0,
-            cat_dim=0,
-        )
-        obs_norm_state = {
-            "loc": temp_env.transform[0].loc.clone(),
-            "scale": temp_env.transform[0].scale.clone(),
-        }
-        temp_env.close()
-        log.info("Observation normalization stats initialized.")
-    
     if num_envs == 1:
         env = make_single_env(cfg, device, obs_norm_state=obs_norm_state, dtype=dtype)
-        if cfg.env.normalize_obs:
-            env.transform[0].init_stats(
-                num_iter=cfg.env.normalize_obs_init_steps,
-                reduce_dim=0,
-                cat_dim=0,
-            )
     else:
         # Use functools.partial instead of lambda for proper serialization
         env = ParallelEnv(
@@ -187,10 +221,35 @@ def train(cfg: DictConfig) -> None:
     if network_dtype is not None:
         log.info(f"Creating networks and observations in dtype: {network_dtype}")
     
-    env = make_parallel_env(cfg, device, num_envs=num_envs, dtype=network_dtype)
+    # ── Observation normalization ────────────────────────────────────
+    obs_rms: RunningMeanStd | None = None
+    init_obs_norm_state: dict | None = None
+    if cfg.env.normalize_obs:
+        # Bootstrap stats from short random rollout in a temporary env
+        log.info("Bootstrapping observation normalization stats...")
+        _tmp = make_single_env(cfg, device, obs_norm_state=None, dtype=network_dtype)
+        # Use init_stats to get initial loc (mean) and scale (std) via standard_normal=True
+        _tmp.transform[0].init_stats(
+            num_iter=cfg.env.normalize_obs_init_steps, reduce_dim=0, cat_dim=0,
+        )
+        obs_dim = _tmp.observation_spec["observation"].shape[-1]
+        obs_rms = RunningMeanStd(shape=(obs_dim,), device=device)
+        obs_rms.mean = _tmp.transform[0].loc.clone()
+        obs_rms.var = _tmp.transform[0].scale.clone().pow(2)  # scale == std → var = std²
+        obs_rms.count = float(cfg.env.normalize_obs_init_steps)
+        init_obs_norm_state = {"mean": obs_rms.mean.clone(), "std": obs_rms.std.clone()}
+        _tmp.close()
+        log.info("Observation normalization bootstrapped (mean=%.3f, std=%.3f)",
+                 obs_rms.mean.mean().item(), obs_rms.std.mean().item())
+
+    env = make_parallel_env(cfg, device, num_envs=num_envs, dtype=network_dtype,
+                            obs_norm_state=init_obs_norm_state)
     log.info("Env: %s | num_envs=%d | obs=%s  act=%s", cfg.env.id, num_envs,
              env.observation_spec["observation"].shape,
              env.action_spec.shape)
+
+    # Separate eval env (single, deterministic) to avoid ParallelEnv auto-reset artefacts
+    eval_env = make_single_env(cfg, device, obs_norm_state=init_obs_norm_state, dtype=network_dtype)
 
     # ── Build PPO modules ──────────────────────────────────────────────
     models = make_ppo_models(env, cfg, device=device, network_device=network_device, dtype=network_dtype)
@@ -284,21 +343,32 @@ def train(cfg: DictConfig) -> None:
         # ── Evaluation ────────────────────────────────────────────────
         if collect_iter % cfg.training.eval_interval == 0:
             with set_exploration_type(ExplorationType.DETERMINISTIC), torch.no_grad():
-                eval_rollout = env.rollout(
-                    cfg.training.eval_rollout_steps, actor
-                )
-                eval_reward_sum = eval_rollout["next", "reward"].sum().item()
-                eval_reward_mean = eval_rollout["next", "reward"].mean().item()
-                eval_steps = eval_rollout["step_count"].max().item()
-                del eval_rollout
+                num_eval_episodes = 5
+                ep_returns = []
+                ep_lengths = []
+                for _ in range(num_eval_episodes):
+                    reset_td = eval_env.reset()
+                    eval_rollout = eval_env.rollout(
+                        cfg.training.eval_rollout_steps, actor,
+                        auto_reset=False, tensordict=reset_td,
+                        break_when_any_done=True,
+                    )
+                    ep_return = eval_rollout["next", "reward"].sum().item()
+                    ep_len = eval_rollout.batch_size[0]
+                    ep_returns.append(ep_return)
+                    ep_lengths.append(ep_len)
+                    del eval_rollout
+
+                eval_reward_sum = sum(ep_returns) / len(ep_returns)
+                eval_steps = sum(ep_lengths) / len(ep_lengths)
 
             metrics.update({
                 "eval/reward_sum": eval_reward_sum,
-                "eval/reward_mean": eval_reward_mean,
+                "eval/reward_mean": eval_reward_sum / max(eval_steps, 1),
                 "eval/step_count": eval_steps,
             })
             log.info(
-                "[iter %d | frames %d] eval_return=%.2f  eval_steps=%d",
+                "[iter %d | frames %d] eval_return=%.2f  eval_steps=%.1f",
                 collect_iter, global_step, eval_reward_sum, eval_steps,
             )
 
@@ -314,17 +384,22 @@ def train(cfg: DictConfig) -> None:
         # ── Checkpointing ─────────────────────────────────────────────
         if collect_iter % cfg.training.save_interval == 0 and collect_iter > 0:
             ckpt_path = ckpt_dir / f"ppo_iter_{collect_iter}.pt"
-            agent = PPOAgent(actor=actor, device=device)
+            agent = PPOAgent(actor=actor, device=device,
+                             obs_rms=obs_rms)
             agent.save(str(ckpt_path))
             log.info("Saved checkpoint → %s", ckpt_path)
 
     pbar.close()
     collector.shutdown()
-    env.close()
+    try:
+        env.close()
+    except RuntimeError:
+        pass  # Already closed by collector shutdown
+    eval_env.close()
 
     # ── Final save ─────────────────────────────────────────────────────
     final_path = ckpt_dir / "ppo_final.pt"
-    PPOAgent(actor=actor, device=device).save(str(final_path))
+    PPOAgent(actor=actor, device=device, obs_rms=obs_rms).save(str(final_path))
     log.info("Training complete. Final model → %s", final_path)
 
     if cfg.wandb.enabled:

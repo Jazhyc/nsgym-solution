@@ -10,8 +10,8 @@ loss_critic_type: smooth_l1   # smooth_l1 | l2
 optimizer: rmsprop              # optimizer: adamw | rmsprop | muon | muon_adamw
 
 # ── Network architecture ───────────────────────────────────────────────
-hidden_sizes: [64, 64]
-activation: Tanh              # any torch.nn activation class name
+hidden_sizes: [256, 256]
+activation: ReLU              # any torch.nn activation class name
 network_device: cpu           # device for neural networks (cpu | cuda | auto)
 
 # ── Performance optimizations ──────────────────────────────────────────

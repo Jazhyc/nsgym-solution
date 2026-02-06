@@ -273,6 +273,8 @@ class PPOAgent(ModelFreeAgent):
             ``observation -> action``).
         device: Torch device the actor lives on.
         deterministic: If ``True`` use the mean action (no sampling).
+        obs_rms: Optional running-mean-std object (or dict with ``mean`` and
+            ``std`` keys) used to normalise raw observations before the actor.
     """
 
     def __init__(
@@ -280,15 +282,35 @@ class PPOAgent(ModelFreeAgent):
         actor: ProbabilisticActor,
         device: torch.device | str = "cpu",
         deterministic: bool = True,
+        obs_rms: Any | None = None,
     ) -> None:
         super().__init__()
         self.actor = actor
         self.device = torch.device(device)
         self.deterministic = deterministic
 
+        # Store obs normalisation stats (mean / std tensors)
+        if obs_rms is not None:
+            if hasattr(obs_rms, "mean"):  # RunningMeanStd object
+                self._obs_mean = obs_rms.mean.clone().to(self.device)
+                self._obs_std = obs_rms.std.clone().to(self.device)
+            elif isinstance(obs_rms, dict):  # loaded from checkpoint
+                self._obs_mean = obs_rms["mean"].to(self.device)
+                self._obs_std = obs_rms["std"].to(self.device)
+            else:
+                self._obs_mean = None
+                self._obs_std = None
+        else:
+            self._obs_mean = None
+            self._obs_std = None
+
     def get_action(self, obs: Dict) -> np.ndarray:
         state = obs["state"]
         state_t = torch.as_tensor(state, dtype=torch.float32, device=self.device)
+
+        # Apply observation normalisation if stats are available
+        if self._obs_mean is not None:
+            state_t = (state_t - self._obs_mean) / self._obs_std
 
         from tensordict import TensorDict
         td = TensorDict({"observation": state_t}, batch_size=[])
@@ -319,11 +341,15 @@ class PPOAgent(ModelFreeAgent):
         checkpoint = torch.load(path, map_location=device, weights_only=False)
         actor = checkpoint["actor"]
         actor.to(device)
-        return cls(actor=actor, device=device, deterministic=deterministic)
+        obs_rms = checkpoint.get("obs_rms", None)
+        return cls(actor=actor, device=device, deterministic=deterministic, obs_rms=obs_rms)
 
     def save(self, path: str) -> None:
-        """Persist the actor so it can be loaded later."""
-        torch.save({"actor": self.actor}, path)
+        """Persist the actor (and obs normalisation stats) so it can be loaded later."""
+        ckpt: dict[str, Any] = {"actor": self.actor}
+        if self._obs_mean is not None:
+            ckpt["obs_rms"] = {"mean": self._obs_mean.cpu(), "std": self._obs_std.cpu()}
+        torch.save(ckpt, path)
 
     def set_seed(self, seed: int) -> None:
         torch.manual_seed(seed)
