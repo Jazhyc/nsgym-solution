@@ -1,0 +1,7 @@
+# ── CartPole environment ────────────────────────────────────────────────
+id: CartPole-v1
+ns_wrapper: classic_control
+frame_skip: 1
+
+normalize_obs: true
+normalize_obs_init_steps: 1000

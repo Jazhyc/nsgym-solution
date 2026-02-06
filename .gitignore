@@ -211,5 +211,6 @@ __marimo__/
 results/
 logs/
 checkpoints/
+!config/env
 
 
