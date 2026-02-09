@@ -108,24 +108,30 @@ class RunningMeanStd:
 
 
 class ObsNormWrapper:
-    """Wrapper that normalizes observations in-place before passing to actor.
+    """VecNormalize-style wrapper: updates running stats and normalizes per-step.
     
-    Unlike VecNormalize which lives inside the env, this wraps the policy so
-    that the collector stores **normalized** observations in the tensordict.
-    This ensures the log-probs recorded during collection are consistent with
-    the observations used during PPO training (no stats-drift).
+    Wraps the policy so that the collector stores normalized observations.
+    Stats are updated per-step with raw observations BEFORE normalizing,
+    exactly like SB3's VecNormalize.  This ensures:
+      - Stats change gradually (O(1/count) per step), not in batch-level jumps
+      - No lossy un-normalization of clamped values
+      - log-probs are consistent with stored observations
     """
-    def __init__(self, actor, obs_rms: RunningMeanStd | None):
+    def __init__(self, actor, obs_rms: RunningMeanStd | None, training: bool = True):
         self.actor = actor
         self.obs_rms = obs_rms
+        self.training = training  # if False, freeze stats (eval mode)
     
     def __call__(self, tensordict):
-        if self.obs_rms is not None and self.obs_rms.count > 0:
+        if self.obs_rms is not None:
             obs = tensordict["observation"]
-            mean = self.obs_rms.mean.to(obs.dtype)
-            std = self.obs_rms.std.to(obs.dtype)
-            # Normalize in-place — the collector keeps these normalized values
-            tensordict["observation"] = ((obs - mean) / std).clamp(-10.0, 10.0)
+            # Update stats with RAW observation before normalizing (VecNormalize order)
+            if self.training and self.obs_rms.count >= 0:
+                self.obs_rms.update(obs)
+            if self.obs_rms.count > 0:
+                mean = self.obs_rms.mean.to(obs.dtype)
+                std = self.obs_rms.std.to(obs.dtype)
+                tensordict["observation"] = ((obs - mean) / std).clamp(-10.0, 10.0)
         return self.actor(tensordict)
 
 
@@ -161,38 +167,30 @@ def initialize_obs_norm(cfg: DictConfig, device: torch.device,
 
 
 def update_obs_norm_with_batch(cfg: DictConfig, obs_rms: RunningMeanStd, 
-                               tensordict_data, update_stats: bool = True) -> None:
-    """Normalize next-observations and optionally update running stats.
+                               tensordict_data) -> None:
+    """Normalize next-observations for training consistency.
     
-    The ObsNormWrapper already normalized ("observation") during collection,
-    so the tensordict contains normalized current-obs and the log-probs are
-    consistent.  We still need to:
-      1. Normalize ("next", "observation") with the SAME stats that were
-         used during collection (for correct GAE / V(s')).
-      2. Optionally update obs_rms for future collection batches.  We
-         un-normalize current obs temporarily to get raw values for the
-         stats update, keeping training data unchanged.
+    The ObsNormWrapper already:
+      - Updated running stats per-step with raw observations (VecNormalize-style)
+      - Normalized ("observation") in the tensordict during collection
+    
+    We still need to normalize ("next", "observation") for the GAE / V(s')
+    computation.  We use the current (post-collection) stats, which are
+    approximately the same as those used during collection since per-step
+    updates shift stats by O(1/count).
     
     Args:
         cfg: Hydra config.
         obs_rms: Running mean/std tracker.
         tensordict_data: Collected batch (modified in-place).
-        update_stats: Whether to update running statistics for future batches.
     """
-    if not cfg.env.normalize_obs or obs_rms is None:
+    if not cfg.env.normalize_obs or obs_rms is None or obs_rms.count <= 0:
         return
     
-    # Stats used during collection (before any update)
-    mean = obs_rms.mean.to(tensordict_data["observation"].dtype)
-    std = obs_rms.std.to(tensordict_data["observation"].dtype)
+    # Use current stats (≈ collection stats since per-step updates are tiny)
+    mean = obs_rms.mean.to(tensordict_data["next", "observation"].dtype)
+    std = obs_rms.std.to(tensordict_data["next", "observation"].dtype)
     
-    # Update running stats using un-normalized observations
-    if update_stats:
-        raw_obs = tensordict_data["observation"] * std + mean
-        obs_rms.update(raw_obs)
-    
-    # Normalize next-observations with the SAME stats used for current obs
-    # (consistency is critical — both V(s) and V(s') must use the same scale)
     next_obs = tensordict_data["next", "observation"]
     tensordict_data["next", "observation"].copy_(
         ((next_obs - mean) / std).clamp(-10.0, 10.0)
@@ -317,8 +315,10 @@ def train(cfg: DictConfig) -> None:
     scheduler = models["scheduler"]
     
     # ── Data collector ─────────────────────────────────────────────────
-    # Wrap actor to normalize observations during collection
-    collection_actor = ObsNormWrapper(actor, obs_rms)
+    # Wrap actor to normalize observations during collection (stats update per-step)
+    collection_actor = ObsNormWrapper(actor, obs_rms, training=True)
+    # Eval wrapper shares same obs_rms but doesn't update stats
+    eval_actor = ObsNormWrapper(actor, obs_rms, training=False)
     
     collector = MultiAsyncCollector(
         [env],
@@ -337,20 +337,13 @@ def train(cfg: DictConfig) -> None:
     pbar = tqdm(total=total_frames, desc="Training")
 
     global_step = 0
-    
-    # Option to freeze normalization updates after warmup for stability
-    # Set this to False to disable continuous updates (more stable)
-    update_normalization_online = cfg.env.get("update_normalization_online", False)
-    log.info(f"Online normalization updates: {update_normalization_online}")
 
     for collect_iter, tensordict_data in enumerate(collector):
         batch_frames = tensordict_data.numel()
         global_step += batch_frames
 
-        # ── Update observation normalization ONCE per batch ────────────
-        # Update stats with raw observations, then normalize the entire batch once
-        # Set update_stats=False to freeze normalization at initialization
-        update_obs_norm_with_batch(cfg, obs_rms, tensordict_data, update_stats=update_normalization_online)
+        # ── Normalize next-observations for training ───────────────────
+        update_obs_norm_with_batch(cfg, obs_rms, tensordict_data)
 
         # ── PPO inner optimisation ─────────────────────────────────────
         epoch_losses: dict[str, list[float]] = {
@@ -420,7 +413,7 @@ def train(cfg: DictConfig) -> None:
                 for _ in range(num_eval_episodes):
                     reset_td = eval_env.reset()
                     eval_rollout = eval_env.rollout(
-                        cfg.training.eval_rollout_steps, collection_actor,
+                        cfg.training.eval_rollout_steps, eval_actor,
                         auto_reset=False, tensordict=reset_td,
                         break_when_any_done=True,
                     )

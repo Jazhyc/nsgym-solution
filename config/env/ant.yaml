@@ -5,5 +5,4 @@ frame_skip: 1
 
 # Observation / reward transforms applied by TorchRL
 normalize_obs: true
-normalize_obs_init_steps: 1000  # random steps for ObservationNorm stats
-update_normalization_online: false  # if true, update stats during training; if false, freeze after init (more stable)
+normalize_obs_init_steps: 1000  # random steps for initial stats bootstrap
