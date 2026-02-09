@@ -176,7 +176,7 @@ def make_ppo_models(
         gamma=cfg.agent.gamma,
         lmbda=cfg.agent.gae_lambda,
         value_network=critic,
-        average_gae=True,
+        average_gae=False,  # This averages over rollout which is not ideal
     )
 
     # -- PPO clipped loss -----------------------------------------------------
@@ -188,6 +188,7 @@ def make_ppo_models(
         entropy_coeff=cfg.agent.entropy_coeff,
         critic_coeff=cfg.agent.critic_coeff,
         loss_critic_type=cfg.agent.loss_critic_type,
+        normalize_advantage=True,  # Per-minibatch advantage normalization (SB3/CleanRL style)
     )
 
     # -- Optimizer & LR scheduler ---------------------------------------------

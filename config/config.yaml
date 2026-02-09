@@ -14,18 +14,18 @@ hydra:
 # ── Data collection ────────────────────────────────────────────────────
 collector:
   num_envs: 20                # number of parallel environments (increased for CPU)
-  total_frames: 10_000_000     # total frames to collect across all training
-  frames_per_batch: 4096      # frames to collect before each training epoch (increased for efficiency)
+  total_frames: 5_000_000     # total frames to collect across all training
+  frames_per_batch: 2560      # frames to collect before each training epoch (increased for efficiency)
   max_frames_per_traj: 1000   # max steps per episode before truncation (env horizon)
 
 # ── Training loop ──────────────────────────────────────────────────────
 training:
   num_epochs: 3               # inner PPO optimisation epochs per batch
-  sub_batch_size: 256         # mini-batch size inside each epoch
-  max_grad_norm: 1.0
-  eval_interval: 24           # evaluate every N collector iterations (~100k steps = 1M/4096*24)
+  sub_batch_size: 128         # mini-batch size inside each epoch
+  max_grad_norm: 0.5
+  eval_interval: 128           # evaluate every N collector iteration
   eval_rollout_steps: 1000    # steps to run during evaluation (deterministic policy, no training)
-  save_interval: 50           # save checkpoint every N collector iterations
+  save_interval: 100           # save checkpoint every N collector iterations
   checkpoint_dir: checkpoints
 
 # ── Reproducibility ────────────────────────────────────────────────────

@@ -2,6 +2,7 @@
 lr: 3.0e-4
 lr_min: 0.0
 gamma: 0.99
+eps_clip: 1.0e-5
 gae_lambda: 0.95
 clip_epsilon: 0.2
 entropy_coeff: 1.0e-4
@@ -11,10 +12,11 @@ optimizer: rmsprop              # optimizer: adamw | rmsprop | muon | muon_adamw
 
 # ── Network architecture ───────────────────────────────────────────────
 hidden_sizes: [256, 256]
-activation: ReLU              # any torch.nn activation class name
+activation: Tanh              # any torch.nn activation class name
 network_device: cpu           # device for neural networks (cpu | cuda | auto)
+use_layer_norm: true         # add LayerNorm after each hidden layer activation
 
 # ── Performance optimizations ──────────────────────────────────────────
-compile: true                # use torch.compile for faster training (PyTorch 2.0+)
-compile_mode: reduce-overhead  # reduce-overhead is better for CPU and small models
+compile: true                # use torch.compile for faster training
+compile_mode: reduce-overhead
 dtype: float32               # network dtype: float32 | float16 | bfloat16 (float16/bfloat16 only beneficial on GPU)
