@@ -20,8 +20,8 @@ collector:
 
 # ── Training loop ──────────────────────────────────────────────────────
 training:
-  num_epochs: 3               # inner PPO optimisation epochs per batch
-  sub_batch_size: 128         # mini-batch size inside each epoch
+  num_epochs: 3              # inner PPO optimisation epochs per batch (SB3 default)
+  sub_batch_size: 128          # mini-batch size inside each epoch (SB3 default)
   max_grad_norm: 0.5
   eval_interval: 128           # evaluate every N collector iteration
   eval_rollout_steps: 1000    # steps to run during evaluation (deterministic policy, no training)

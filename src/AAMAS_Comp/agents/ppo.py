@@ -57,6 +57,8 @@ def make_actor(
         activation=activation,
         device=device,
         dtype=dtype,
+        ortho_init=True,
+        output_gain=0.01,  # Small gain → near-uniform initial policy (SB3 default)
     )
     
     # Wrap with NormalParamExtractor after dtype conversion
@@ -100,6 +102,8 @@ def make_critic(
         activation=activation,
         device=device,
         dtype=dtype,
+        ortho_init=True,
+        output_gain=1.0,  # Critic output gain (SB3 default)
     )
     critic = ValueOperator(module=net, in_keys=["observation"])
     

@@ -107,131 +107,99 @@ class RunningMeanStd:
         self.count = d["count"]
 
 
-class ObsNormWrapper:
-    """VecNormalize-style wrapper: updates running stats and normalizes per-step.
+class RewardNormalizer:
+    """VecNormalize-style reward scaling.
     
-    Wraps the policy so that the collector stores normalized observations.
-    Stats are updated per-step with raw observations BEFORE normalizing,
-    exactly like SB3's VecNormalize.  This ensures:
-      - Stats change gradually (O(1/count) per step), not in batch-level jumps
-      - No lossy un-normalization of clamped values
-      - log-probs are consistent with stored observations
+    Tracks running variance of rewards and divides by sqrt(var) to bring
+    reward magnitudes to ~O(1).  Does NOT subtract the mean.
+    
+    Uses epsilon-initialized count (like SB3) so the initial std = 1.0
+    (identity scaling) and statistics build up gradually.
     """
-    def __init__(self, actor, obs_rms: RunningMeanStd | None, training: bool = True):
-        self.actor = actor
-        self.obs_rms = obs_rms
-        self.training = training  # if False, freeze stats (eval mode)
+    def __init__(self, device: torch.device | None = None):
+        self.reward_rms = RunningMeanStd(shape=(), device=device)
+        # Initialize with epsilon count so initial std = sqrt(1.0) = 1.0
+        self.reward_rms.count = 1e-4
     
-    def __call__(self, tensordict):
-        if self.obs_rms is not None:
-            obs = tensordict["observation"]
-            # Update stats with RAW observation before normalizing (VecNormalize order)
-            if self.training and self.obs_rms.count >= 0:
-                self.obs_rms.update(obs)
-            if self.obs_rms.count > 0:
-                mean = self.obs_rms.mean.to(obs.dtype)
-                std = self.obs_rms.std.to(obs.dtype)
-                tensordict["observation"] = ((obs - mean) / std).clamp(-10.0, 10.0)
-        return self.actor(tensordict)
+    def normalize_batch(self, tensordict_data) -> None:
+        """Update stats and normalize rewards in a collected batch in-place."""
+        rewards = tensordict_data["next", "reward"]
+        # Update running stats with raw rewards (vectorized, no Python loop)
+        self.reward_rms.update(rewards)
+        # Scale rewards by 1/std (no mean subtraction)
+        std = self.reward_rms.std.to(rewards.dtype)
+        tensordict_data["next", "reward"].copy_(rewards / std)
 
 
 def initialize_obs_norm(cfg: DictConfig, device: torch.device, 
-                        dtype: torch.dtype | None = None) -> tuple[RunningMeanStd, dict] | tuple[None, None]:
+                        dtype: torch.dtype | None = None) -> RunningMeanStd | None:
     """Bootstrap observation normalization statistics from initial random rollout.
     
     Returns:
-        Tuple of (RunningMeanStd, init_state_dict) or (None, None) if not enabled.
+        RunningMeanStd with bootstrap stats, or None if not enabled.
     """
     if not cfg.env.normalize_obs:
-        return None, None
+        return None
     
     log.info("Bootstrapping observation normalization stats...")
-    _tmp = make_single_env(cfg, device, obs_norm_state=None, dtype=dtype)
-    
-    # Collect observations from a single rollout
-    _tmp.reset()
-    td = _tmp.rollout(max_steps=cfg.env.normalize_obs_init_steps, break_when_any_done=False)
+    # Use a plain env (no normalization) to collect raw observations
+    base_env = GymEnv(cfg.env.id, device=device)
+    tmp = TransformedEnv(base_env, Compose(DoubleToFloat(), StepCounter()))
+    tmp.reset()
+    td = tmp.rollout(max_steps=cfg.env.normalize_obs_init_steps, break_when_any_done=False)
     all_obs = td["observation"]
     
-    obs_dim = _tmp.observation_spec["observation"].shape[-1]
+    obs_dim = tmp.observation_spec["observation"].shape[-1]
     obs_rms = RunningMeanStd(shape=(obs_dim,), device=device)
+    obs_rms.count = 1e-4  # SB3-style epsilon init so initial std=1
     obs_rms.update(all_obs)
-    
-    init_obs_norm_state = {"mean": obs_rms.mean.clone(), "std": obs_rms.std.clone()}
-    _tmp.close()
+    tmp.close()
     
     log.info("Observation normalization bootstrapped (mean=%.3f, std=%.3f)",
              obs_rms.mean.mean().item(), obs_rms.std.mean().item())
     
-    return obs_rms, init_obs_norm_state
-
-
-def update_obs_norm_with_batch(cfg: DictConfig, obs_rms: RunningMeanStd, 
-                               tensordict_data) -> None:
-    """Normalize next-observations for training consistency.
-    
-    The ObsNormWrapper already:
-      - Updated running stats per-step with raw observations (VecNormalize-style)
-      - Normalized ("observation") in the tensordict during collection
-    
-    We still need to normalize ("next", "observation") for the GAE / V(s')
-    computation.  We use the current (post-collection) stats, which are
-    approximately the same as those used during collection since per-step
-    updates shift stats by O(1/count).
-    
-    Args:
-        cfg: Hydra config.
-        obs_rms: Running mean/std tracker.
-        tensordict_data: Collected batch (modified in-place).
-    """
-    if not cfg.env.normalize_obs or obs_rms is None or obs_rms.count <= 0:
-        return
-    
-    # Use current stats (≈ collection stats since per-step updates are tiny)
-    mean = obs_rms.mean.to(tensordict_data["next", "observation"].dtype)
-    std = obs_rms.std.to(tensordict_data["next", "observation"].dtype)
-    
-    next_obs = tensordict_data["next", "observation"]
-    tensordict_data["next", "observation"].copy_(
-        ((next_obs - mean) / std).clamp(-10.0, 10.0)
-    )
+    return obs_rms
 
 
 # ---------------------------------------------------------------------------
 # Environment factory
 # ---------------------------------------------------------------------------
 
-def make_single_env(cfg: DictConfig, device: torch.device, obs_norm_state: dict | None = None, dtype: torch.dtype | None = None) -> TransformedEnv:
+def make_single_env(cfg: DictConfig, device: torch.device, obs_rms: RunningMeanStd | None = None, dtype: torch.dtype | None = None) -> TransformedEnv:
     """Create a single TorchRL ``TransformedEnv`` instance.
     
     Args:
         cfg: Hydra config.
         device: Device for the environment.
-        obs_norm_state: Not used (kept for compatibility).
-        dtype: Optional dtype to cast observations to (e.g., torch.bfloat16).
+        obs_rms: Optional RunningMeanStd with frozen stats for ObservationNorm.
+        dtype: Optional dtype to cast observations to.
     """
     base_env = GymEnv(cfg.env.id, device=device)
 
-    transforms = [
-        DoubleToFloat(),
-        StepCounter(),
-    ]
+    transforms = []
+    if obs_rms is not None:
+        obs_norm = ObservationNorm(in_keys=["observation"], standard_normal=True)
+        # Materialise lazy buffers with frozen stats from bootstrap
+        obs_norm.loc = torch.nn.Parameter(obs_rms.mean.float().clone(), requires_grad=False)
+        obs_norm.scale = torch.nn.Parameter(obs_rms.std.float().clone(), requires_grad=False)
+        transforms.append(obs_norm)
+    transforms.append(DoubleToFloat())
+    transforms.append(StepCounter())
 
     env = TransformedEnv(base_env, Compose(*transforms))
     return env
 
 
-def make_parallel_env(cfg: DictConfig, device: torch.device, num_envs: int = 1, dtype: torch.dtype | None = None, obs_norm_state: dict | None = None) -> TransformedEnv | ParallelEnv:
+def make_parallel_env(cfg: DictConfig, device: torch.device, num_envs: int = 1, dtype: torch.dtype | None = None, obs_rms: RunningMeanStd | None = None) -> TransformedEnv | ParallelEnv:
     """Create vectorized parallel environments."""
     from functools import partial
     
     if num_envs == 1:
-        env = make_single_env(cfg, device, obs_norm_state=obs_norm_state, dtype=dtype)
+        env = make_single_env(cfg, device, obs_rms=obs_rms, dtype=dtype)
     else:
-        # Use functools.partial instead of lambda for proper serialization
         env = ParallelEnv(
             num_workers=num_envs,
-            create_env_fn=partial(make_single_env, cfg, device, obs_norm_state, dtype),
+            create_env_fn=partial(make_single_env, cfg, device, obs_rms, dtype),
             serial_for_single=True,
         )
     
@@ -295,16 +263,22 @@ def train(cfg: DictConfig) -> None:
         log.info(f"Creating networks and observations in dtype: {network_dtype}")
     
     # ── Observation normalization ────────────────────────────────────
-    obs_rms, init_obs_norm_state = initialize_obs_norm(cfg, device, dtype=network_dtype)
+    obs_rms = initialize_obs_norm(cfg, device, dtype=network_dtype)
+
+    # ── Reward normalization (VecNormalize-style) ──────────────────────
+    ret_normalizer = None
+    if cfg.env.get("normalize_reward", False):
+        ret_normalizer = RewardNormalizer(device=device)
+        log.info("Reward normalization enabled")
 
     env = make_parallel_env(cfg, device, num_envs=num_envs, dtype=network_dtype,
-                            obs_norm_state=init_obs_norm_state)
+                            obs_rms=obs_rms)
     log.info("Env: %s | num_envs=%d | obs=%s  act=%s", cfg.env.id, num_envs,
              env.observation_spec["observation"].shape,
              env.action_spec.shape)
 
     # Separate eval env (single, deterministic) to avoid ParallelEnv auto-reset artefacts
-    eval_env = make_single_env(cfg, device, obs_norm_state=init_obs_norm_state, dtype=network_dtype)
+    eval_env = make_single_env(cfg, device, obs_rms=obs_rms, dtype=network_dtype)
 
     # ── Build PPO modules ──────────────────────────────────────────────
     models = make_ppo_models(env, cfg, device=device, network_device=network_device, dtype=network_dtype)
@@ -315,14 +289,11 @@ def train(cfg: DictConfig) -> None:
     scheduler = models["scheduler"]
     
     # ── Data collector ─────────────────────────────────────────────────
-    # Wrap actor to normalize observations during collection (stats update per-step)
-    collection_actor = ObsNormWrapper(actor, obs_rms, training=True)
-    # Eval wrapper shares same obs_rms but doesn't update stats
-    eval_actor = ObsNormWrapper(actor, obs_rms, training=False)
-    
+    # ObservationNorm is in the env transforms → observations in tensordict
+    # are already normalized. Use plain actor for collection.
     collector = MultiAsyncCollector(
         [env],
-        collection_actor,
+        actor,
         frames_per_batch=cfg.collector.frames_per_batch,
         total_frames=cfg.collector.total_frames,
         device=device,
@@ -342,8 +313,12 @@ def train(cfg: DictConfig) -> None:
         batch_frames = tensordict_data.numel()
         global_step += batch_frames
 
-        # ── Normalize next-observations for training ───────────────────
-        update_obs_norm_with_batch(cfg, obs_rms, tensordict_data)
+        # ── Save raw reward for logging (before normalization) ─────────
+        raw_mean_reward = tensordict_data["next", "reward"].mean().item()
+
+        # ── Normalize rewards (VecNormalize-style) ─────────────────────
+        if ret_normalizer is not None:
+            ret_normalizer.normalize_batch(tensordict_data)
 
         # ── PPO inner optimisation ─────────────────────────────────────
         epoch_losses: dict[str, list[float]] = {
@@ -371,7 +346,7 @@ def train(cfg: DictConfig) -> None:
                 loss_total = (
                     loss_vals["loss_objective"]
                     + loss_vals["loss_critic"]
-                    + loss_vals["loss_entropy"]
+                    + loss_vals.get("loss_entropy", 0.0)
                 )
 
                 loss_total.backward()
@@ -383,13 +358,13 @@ def train(cfg: DictConfig) -> None:
 
                 epoch_losses["loss_objective"].append(loss_vals["loss_objective"].item())
                 epoch_losses["loss_critic"].append(loss_vals["loss_critic"].item())
-                epoch_losses["loss_entropy"].append(loss_vals["loss_entropy"].item())
+                epoch_losses["loss_entropy"].append(loss_vals.get("loss_entropy", torch.tensor(0.0)).item())
                 epoch_losses["loss_total"].append(loss_total.item())
 
         scheduler.step()
 
         # ── Logging ────────────────────────────────────────────────────
-        mean_reward = tensordict_data["next", "reward"].mean().item()
+        mean_reward = raw_mean_reward  # Use raw (non-normalized) reward
         max_step_count = tensordict_data["step_count"].max().item()
         lr_now = optimizer.param_groups[0]["lr"]
 
@@ -413,7 +388,7 @@ def train(cfg: DictConfig) -> None:
                 for _ in range(num_eval_episodes):
                     reset_td = eval_env.reset()
                     eval_rollout = eval_env.rollout(
-                        cfg.training.eval_rollout_steps, eval_actor,
+                        cfg.training.eval_rollout_steps, actor,
                         auto_reset=False, tensordict=reset_td,
                         break_when_any_done=True,
                     )

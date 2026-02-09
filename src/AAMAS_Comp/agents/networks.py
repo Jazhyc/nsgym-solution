@@ -20,8 +20,10 @@ def make_mlp(
     output_activation: str | None = None,
     device: torch.device | str = "cpu",
     dtype: torch.dtype | None = None,
+    ortho_init: bool = True,
+    output_gain: float = 1.0,
 ) -> nn.Sequential:
-    """Build a simple MLP.
+    """Build a simple MLP with optional orthogonal initialization (SB3-style).
 
     Args:
         in_features: Dimension of the input.
@@ -31,6 +33,10 @@ def make_mlp(
         output_activation: Optional activation after the final layer.
         device: Device to place the module on.
         dtype: Optional dtype for network parameters.
+        ortho_init: Use orthogonal initialization (SB3 default). Hidden layers
+            get gain=sqrt(2), output layer gets ``output_gain``.
+        output_gain: Gain for the output layer when ``ortho_init=True``.
+            Use 0.01 for actor (near-uniform initial policy) and 1.0 for critic.
 
     Returns:
         A ``nn.Sequential`` MLP.
@@ -40,11 +46,19 @@ def make_mlp(
 
     prev = in_features
     for h in hidden_sizes:
-        layers.append(nn.Linear(prev, h, device=device))
+        linear = nn.Linear(prev, h, device=device)
+        if ortho_init:
+            nn.init.orthogonal_(linear.weight, gain=nn.init.calculate_gain('relu'))
+            nn.init.constant_(linear.bias, 0.0)
+        layers.append(linear)
         layers.append(act_cls())
         prev = h
 
-    layers.append(nn.Linear(prev, out_features, device=device))
+    output_linear = nn.Linear(prev, out_features, device=device)
+    if ortho_init:
+        nn.init.orthogonal_(output_linear.weight, gain=output_gain)
+        nn.init.constant_(output_linear.bias, 0.0)
+    layers.append(output_linear)
 
     if output_activation is not None:
         layers.append(getattr(nn, output_activation)())
