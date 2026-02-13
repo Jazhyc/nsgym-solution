@@ -14,7 +14,7 @@ optimizer: adamw              # optimizer: adamw | rmsprop | muon | muon_adamw
 hidden_sizes: [256, 256]
 activation: Tanh              # any torch.nn activation class name
 network_device: cpu           # device for neural networks (cpu | cuda | auto)
-use_layer_norm: false         # add LayerNorm after each hidden layer activation
+use_layer_norm: true         # add LayerNorm after each hidden layer activation
 
 # ── Performance optimizations ──────────────────────────────────────────
 compile: true                # use torch.compile for faster training

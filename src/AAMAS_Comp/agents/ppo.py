@@ -232,12 +232,8 @@ def make_ppo_models(
         optimizer = torch.optim.AdamW(loss_module.parameters(), lr=cfg.agent.lr)
     elif optimizer_type == "rmsprop":
         optimizer = torch.optim.RMSprop(loss_module.parameters(), lr=cfg.agent.lr)
-    elif optimizer_type == "muon":
-        if not params_2d:
-            raise ValueError("Muon optimizer requires 2D parameters, but none found")
-        optimizer = torch.optim.Muon(params_2d, lr=cfg.agent.lr)
     elif optimizer_type == "muon_adamw":
-        muon_opt = torch.optim.Muon(params_2d, lr=cfg.agent.lr) if params_2d else None
+        muon_opt = torch.optim.Muon(params_2d, lr=cfg.agent.lr, adjust_lr_fn="match_rms_adamw") if params_2d else None
         adamw_opt = torch.optim.AdamW(params_1d, lr=cfg.agent.lr) if params_1d else None
         
         if muon_opt and adamw_opt:
@@ -250,10 +246,12 @@ def make_ppo_models(
         raise ValueError(f"Unknown optimizer type: {optimizer_type}")
 
     total_iters = cfg.collector.total_frames // cfg.collector.frames_per_batch
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+    # Linear LR decay to lr_min (SB3 default schedule)
+    scheduler = torch.optim.lr_scheduler.LinearLR(
         optimizer,
-        T_max=total_iters,
-        eta_min=cfg.agent.lr_min,
+        start_factor=1.0,
+        end_factor=max(cfg.agent.lr_min / cfg.agent.lr, 1e-8),
+        total_iters=total_iters,
     )
 
     return {
