@@ -330,7 +330,8 @@ def train(cfg: DictConfig) -> None:
 
         for _epoch in range(cfg.training.num_epochs):
             # Recompute advantage each epoch (value net is being updated)
-            advantage_module(tensordict_data)
+            with torch.no_grad():
+                advantage_module(tensordict_data)
 
             # Flatten the data and create random permutation for mini-batch sampling
             data_view = tensordict_data.reshape(-1)
@@ -354,12 +355,13 @@ def train(cfg: DictConfig) -> None:
                     loss_module.parameters(), cfg.training.max_grad_norm
                 )
                 optimizer.step()
-                optimizer.zero_grad()
+                optimizer.zero_grad(set_to_none=True)
 
-                epoch_losses["loss_objective"].append(loss_vals["loss_objective"].item())
-                epoch_losses["loss_critic"].append(loss_vals["loss_critic"].item())
-                epoch_losses["loss_entropy"].append(loss_vals.get("loss_entropy", torch.tensor(0.0)).item())
-                epoch_losses["loss_total"].append(loss_total.item())
+                # Collect tensors; defer .item() to avoid per-minibatch sync
+                epoch_losses["loss_objective"].append(loss_vals["loss_objective"].detach())
+                epoch_losses["loss_critic"].append(loss_vals["loss_critic"].detach())
+                epoch_losses["loss_entropy"].append(loss_vals.get("loss_entropy", torch.tensor(0.0)).detach())
+                epoch_losses["loss_total"].append(loss_total.detach())
 
         scheduler.step()
 
@@ -368,7 +370,7 @@ def train(cfg: DictConfig) -> None:
         max_step_count = tensordict_data["step_count"].max().item()
         lr_now = optimizer.param_groups[0]["lr"]
 
-        avg_losses = {k: sum(v) / len(v) for k, v in epoch_losses.items()}
+        avg_losses = {k: torch.stack(v).mean().item() for k, v in epoch_losses.items()}
 
         metrics = {
             "train/reward_mean": mean_reward,

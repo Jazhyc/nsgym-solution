@@ -32,36 +32,6 @@ log = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
-# Muon float32 Newton-Schulz patch for CPU (bfloat16 matmul is ~20x slower
-# on CPUs without AMX/AVX-512-BF16 instructions)
-# ---------------------------------------------------------------------------
-
-def _zeropower_via_newtonschulz_f32(grad, ns_coefficients, ns_steps, eps):
-    """Newton-Schulz iteration in float32 instead of bfloat16 for CPU perf."""
-    a, b, c = ns_coefficients
-    ortho_grad = grad.float()  # float32 instead of bfloat16
-    if grad.size(0) > grad.size(1):
-        ortho_grad = ortho_grad.T
-    ortho_grad.div_(ortho_grad.norm().clamp(min=eps))
-    for _ in range(ns_steps):
-        gram_matrix = ortho_grad @ ortho_grad.T
-        gram_update = torch.addmm(
-            gram_matrix, gram_matrix, gram_matrix, beta=b, alpha=c
-        )
-        ortho_grad = torch.addmm(ortho_grad, gram_update, ortho_grad, beta=a)
-    if grad.size(0) > grad.size(1):
-        ortho_grad = ortho_grad.T
-    return ortho_grad
-
-
-def _patch_muon_for_cpu():
-    """Monkeypatch Muon's NS iteration to use float32 on CPU."""
-    import torch.optim._muon as _muon_mod
-    _muon_mod._zeropower_via_newtonschulz = _zeropower_via_newtonschulz_f32
-    log.info("Patched Muon Newton-Schulz to use float32 (CPU-friendly)")
-
-
-# ---------------------------------------------------------------------------
 # Model factories
 # ---------------------------------------------------------------------------
 
@@ -256,9 +226,6 @@ def make_ppo_models(
     elif optimizer_type == "rmsprop":
         optimizer = torch.optim.RMSprop(loss_module.parameters(), lr=cfg.agent.lr)
     elif optimizer_type == "muon_adamw":
-        # Patch Muon's Newton-Schulz to use float32 on CPU (bfloat16 matmul is ~20x slower)
-        if network_device.type == "cpu":
-            _patch_muon_for_cpu()
         ns_steps = cfg.agent.get("muon_ns_steps", 5)
         muon_opt = torch.optim.Muon(params_2d, lr=cfg.agent.lr, adjust_lr_fn="match_rms_adamw", ns_steps=ns_steps) if params_2d else None
         adamw_opt = torch.optim.AdamW(params_1d, lr=cfg.agent.lr) if params_1d else None
