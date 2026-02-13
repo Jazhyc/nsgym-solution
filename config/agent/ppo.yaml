@@ -13,7 +13,7 @@ optimizer: adamw              # optimizer: adamw | rmsprop
 # ── Network architecture ─────────────────────────────────────────────────
 hidden_sizes: [256, 256]
 activation: Tanh              # any torch.nn activation class name
-share_trunk: true             # share hidden layers between actor and critic (saves ~1 trunk forward per mini-batch)
+share_trunk: false             # share hidden layers between actor and critic (saves ~1 trunk forward per mini-batch)
 network_device: cpu           # device for neural networks (cpu | cuda | auto)
 use_layer_norm: true         # add LayerNorm after each hidden layer activation
 
