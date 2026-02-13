@@ -110,6 +110,83 @@ def make_critic(
     return critic
 
 
+def make_shared_actor_critic(
+    obs_dim: int,
+    act_dim: int,
+    hidden_sizes: Sequence[int],
+    activation: str,
+    device: torch.device | str,
+    action_spec: Any | None = None,
+    dtype: torch.dtype | None = None,
+) -> tuple[ProbabilisticActor, ValueOperator]:
+    """Build actor and critic that share hidden-layer weights.
+
+    The trunk (all hidden layers) is the *same* ``nn.Module`` object
+    embedded in both networks, so their parameters are shared.  Each
+    network reads ``"observation"`` and can be used directly with
+    TorchRL's GAE / ClipPPOLoss — no manual trunk forwarding required.
+    """
+    # ── Shared trunk (all hidden layers) ──────────────────────────────
+    trunk_net = make_mlp(
+        in_features=obs_dim,
+        out_features=hidden_sizes[-1],
+        hidden_sizes=hidden_sizes[:-1],
+        activation=activation,
+        output_activation=activation,
+        device=device,
+        dtype=dtype,
+        ortho_init=True,
+        output_gain=nn.init.calculate_gain("relu"),
+    )
+
+    # ── Actor head (single Linear → NormalParamExtractor) ─────────────
+    actor_head = make_mlp(
+        in_features=hidden_sizes[-1],
+        out_features=2 * act_dim,
+        hidden_sizes=[],
+        device=device,
+        dtype=dtype,
+        ortho_init=True,
+        output_gain=0.01,
+    )
+
+    # ── Critic head (single Linear → 1) ──────────────────────────────
+    critic_head = make_mlp(
+        in_features=hidden_sizes[-1],
+        out_features=1,
+        hidden_sizes=[],
+        device=device,
+        dtype=dtype,
+        ortho_init=True,
+        output_gain=1.0,
+    )
+
+    # Full nets — trunk_net is the SAME object → weights are shared
+    actor_net = nn.Sequential(trunk_net, actor_head, NormalParamExtractor())
+    critic_net = nn.Sequential(trunk_net, critic_head)
+
+    # ── TorchRL wrappers (identical API to make_actor / make_critic) ──
+    policy_module = TensorDictModule(
+        actor_net, in_keys=["observation"], out_keys=["loc", "scale"]
+    )
+    dist_kwargs = {}
+    if action_spec is not None:
+        dist_kwargs["low"] = action_spec.space.low
+        dist_kwargs["high"] = action_spec.space.high
+
+    actor = ProbabilisticActor(
+        module=policy_module,
+        spec=action_spec,
+        in_keys=["loc", "scale"],
+        distribution_class=TanhNormal,
+        distribution_kwargs=dist_kwargs,
+        return_log_prob=True,
+    )
+    critic = ValueOperator(module=critic_net, in_keys=["observation"])
+
+    return actor, critic
+
+
 def make_ppo_models(
     env: EnvBase,
     cfg: DictConfig,
@@ -144,46 +221,51 @@ def make_ppo_models(
     act_dim = env.action_spec.shape[-1]
     hidden_sizes = list(cfg.agent.hidden_sizes)
     activation = cfg.agent.activation
+    share_trunk = cfg.agent.get("share_trunk", False)
+    compile_enabled = cfg.agent.get("compile", False)
+    compile_mode = cfg.agent.get("compile_mode", "default") if compile_enabled else None
 
-    actor = make_actor(
-        obs_dim=obs_dim,
-        act_dim=act_dim,
-        hidden_sizes=hidden_sizes,
-        activation=activation,
-        device=network_device,
-        action_spec=env.action_spec_unbatched,
-        dtype=dtype,
-    )
+    if share_trunk:
+        log.info("Using shared actor-critic trunk")
+        actor, critic = make_shared_actor_critic(
+            obs_dim=obs_dim,
+            act_dim=act_dim,
+            hidden_sizes=hidden_sizes,
+            activation=activation,
+            device=network_device,
+            action_spec=env.action_spec_unbatched,
+            dtype=dtype,
+        )
+    else:
+        actor = make_actor(
+            obs_dim=obs_dim,
+            act_dim=act_dim,
+            hidden_sizes=hidden_sizes,
+            activation=activation,
+            device=network_device,
+            action_spec=env.action_spec_unbatched,
+            dtype=dtype,
+        )
+        critic = make_critic(
+            obs_dim=obs_dim,
+            hidden_sizes=hidden_sizes,
+            activation=activation,
+            device=network_device,
+            dtype=dtype,
+        )
 
-    critic = make_critic(
-        obs_dim=obs_dim,
-        hidden_sizes=hidden_sizes,
-        activation=activation,
-        device=network_device,
-        dtype=dtype,
-    )
-
-    # -- Apply torch.compile if enabled -------------------------------------
-    # Compile the underlying neural network modules BEFORE creating loss module
-    # This ensures the loss module captures the compiled versions
-    if cfg.agent.get("compile", False):
+    if compile_enabled:
         log.info("Compiling network modules with torch.compile...")
-        compile_mode = cfg.agent.get("compile_mode", "default")
-        # Compile the underlying Sequential modules, not the TensorDictModule wrappers
-        # Structure is: actor.module (TensorDictModule) -> [0] (Sequential with MLP + NormalParamExtractor)
         actor.module[0] = torch.compile(actor.module[0], mode=compile_mode)
-        # Critic has ValueOperator wrapping TensorDictModule wrapping the MLP
         critic.module = torch.compile(critic.module, mode=compile_mode)
 
-    # -- Advantage estimation (GAE) ------------------------------------------
     advantage = GAE(
         gamma=cfg.agent.gamma,
         lmbda=cfg.agent.gae_lambda,
         value_network=critic,
-        average_gae=False,  # This averages over rollout which is not ideal
+        average_gae=False,
     )
 
-    # -- PPO clipped loss -----------------------------------------------------
     loss_module = ClipPPOLoss(
         actor_network=actor,
         critic_network=critic,
@@ -192,55 +274,23 @@ def make_ppo_models(
         entropy_coeff=cfg.agent.entropy_coeff,
         critic_coeff=cfg.agent.critic_coeff,
         loss_critic_type=cfg.agent.loss_critic_type,
-        normalize_advantage=True,  # Per-minibatch advantage normalization (SB3/CleanRL style)
+        normalize_advantage=True,
     )
 
+    # Deduplicate params (shared trunk params appear in both actor & critic)
+    optim_params = list({id(p): p for p in loss_module.parameters()}.values())
+
     # -- Optimizer & LR scheduler ---------------------------------------------
-    # Muon only supports 2D parameters, so we separate them
-    params_2d = [p for p in loss_module.parameters() if p.dim() >= 2]
-    params_1d = [p for p in loss_module.parameters() if p.dim() < 2]
-    
-    # Create separate optimizers for 2D and 1D parameters
-    class CombinedOptimizer(torch.optim.Optimizer):
-        """Wrapper to handle both Muon (2D) and AdamW (1D) optimizers together."""
-        def __init__(self, muon_opt, adamw_opt):
-            self.muon_opt = muon_opt
-            self.adamw_opt = adamw_opt
-            # Combine param groups from both optimizers
-            self.param_groups = muon_opt.param_groups + adamw_opt.param_groups
-            self.defaults = {}
-        
-        def step(self, closure=None):
-            self.muon_opt.step()
-            self.adamw_opt.step()
-        
-        def zero_grad(self, set_to_none=False):
-            self.muon_opt.zero_grad(set_to_none=set_to_none)
-            self.adamw_opt.zero_grad(set_to_none=set_to_none)
-    
-    # Create optimizer based on config
     optimizer_type = cfg.agent.get("optimizer", "adamw").lower()
-    
+
     if optimizer_type == "adamw":
-        optimizer = torch.optim.AdamW(loss_module.parameters(), lr=cfg.agent.lr)
+        optimizer = torch.optim.AdamW(optim_params, lr=cfg.agent.lr)
     elif optimizer_type == "rmsprop":
-        optimizer = torch.optim.RMSprop(loss_module.parameters(), lr=cfg.agent.lr)
-    elif optimizer_type == "muon_adamw":
-        ns_steps = cfg.agent.get("muon_ns_steps", 5)
-        muon_opt = torch.optim.Muon(params_2d, lr=cfg.agent.lr, adjust_lr_fn="match_rms_adamw", ns_steps=ns_steps) if params_2d else None
-        adamw_opt = torch.optim.AdamW(params_1d, lr=cfg.agent.lr) if params_1d else None
-        
-        if muon_opt and adamw_opt:
-            optimizer = CombinedOptimizer(muon_opt, adamw_opt)
-        elif muon_opt:
-            optimizer = muon_opt
-        else:
-            optimizer = adamw_opt
+        optimizer = torch.optim.RMSprop(optim_params, lr=cfg.agent.lr)
     else:
         raise ValueError(f"Unknown optimizer type: {optimizer_type}")
 
     total_iters = cfg.collector.total_frames // cfg.collector.frames_per_batch
-    # Linear LR decay to lr_min (SB3 default schedule)
     scheduler = torch.optim.lr_scheduler.LinearLR(
         optimizer,
         start_factor=1.0,
@@ -250,11 +300,11 @@ def make_ppo_models(
 
     return {
         "actor": actor,
-        "critic": critic,
         "advantage": advantage,
         "loss_module": loss_module,
         "optimizer": optimizer,
         "scheduler": scheduler,
+        "optim_params": optim_params,
     }
 
 

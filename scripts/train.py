@@ -287,6 +287,7 @@ def train(cfg: DictConfig) -> None:
     loss_module = models["loss_module"]
     optimizer = models["optimizer"]
     scheduler = models["scheduler"]
+    optim_params = models["optim_params"]
     
     # ── Data collector ─────────────────────────────────────────────────
     # ObservationNorm is in the env transforms → observations in tensordict
@@ -352,7 +353,7 @@ def train(cfg: DictConfig) -> None:
 
                 loss_total.backward()
                 torch.nn.utils.clip_grad_norm_(
-                    loss_module.parameters(), cfg.training.max_grad_norm
+                    optim_params, cfg.training.max_grad_norm
                 )
                 optimizer.step()
                 optimizer.zero_grad(set_to_none=True)
