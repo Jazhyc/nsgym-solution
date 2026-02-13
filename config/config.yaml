@@ -22,10 +22,10 @@ collector:
 training:
   num_epochs: 3              # inner PPO optimisation epochs per batch
   sub_batch_size: 256           # mini-batch size inside each epoch
-  max_grad_norm: 0.5
+  max_grad_norm: 1
   eval_interval: 128           # evaluate every N collector iteration
   eval_rollout_steps: 1000    # steps to run during evaluation (deterministic policy, no training)
-  save_interval: 100           # save checkpoint every N collector iterations
+  save_interval: 10000           # save checkpoint every N collector iterations
   checkpoint_dir: checkpoints
 
 # ── Reproducibility ────────────────────────────────────────────────────
