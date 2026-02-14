@@ -310,6 +310,11 @@ def train(cfg: DictConfig) -> None:
     ckpt_dir = Path(cfg.training.checkpoint_dir)
     ckpt_dir.mkdir(parents=True, exist_ok=True)
 
+    # ── V-trace setup ──────────────────────────────────────────────────
+    use_vtrace = cfg.agent.get("use_vtrace", False)
+    if use_vtrace:
+        log.info("V-trace off-policy correction enabled for async collector")
+
     # ── Training loop ──────────────────────────────────────────────────
     total_frames = cfg.collector.total_frames
     pbar = tqdm(total=total_frames, desc="Training")
@@ -335,10 +340,26 @@ def train(cfg: DictConfig) -> None:
             "loss_total": [],
         }
 
-        for _epoch in range(cfg.training.num_epochs):
-            # Recompute advantage each epoch (value net is being updated)
+        # Compute V-trace advantages once before epoch loop (expensive due
+        # to actor forward pass; correction is for behavior→current mismatch,
+        # not intra-epoch drift).  GAE is cheap so we keep it per-epoch.
+        if use_vtrace:
             with torch.no_grad():
-                advantage_module(tensordict_data)
+                if tensordict_data.ndim == 1:
+                    time_steps = batch_frames // num_envs
+                    td_seq = tensordict_data.reshape(num_envs, time_steps)
+                else:
+                    td_seq = tensordict_data
+                advantage_module(td_seq)
+                if tensordict_data.ndim == 1:
+                    tensordict_data = td_seq.reshape(-1)
+
+        for _epoch in range(cfg.training.num_epochs):
+            # Recompute GAE each epoch (value net is being updated);
+            # V-trace was already computed once above.
+            if not use_vtrace:
+                with torch.no_grad():
+                    advantage_module(tensordict_data)
 
             # Flatten the data and create random permutation for mini-batch sampling
             data_view = tensordict_data.reshape(-1)

@@ -23,7 +23,7 @@ from torch import nn
 from torchrl.envs import EnvBase
 from torchrl.modules import ProbabilisticActor, TanhNormal, ValueOperator
 from torchrl.objectives import ClipPPOLoss
-from torchrl.objectives.value import GAE
+from torchrl.objectives.value import GAE, VTrace
 
 from AAMAS_Comp.agents.networks import make_mlp
 from AAMAS_Comp.base_agent import ModelFreeAgent
@@ -405,12 +405,26 @@ def make_ppo_models(
         actor.module[0] = torch.compile(actor.module[0], mode=compile_mode)
         critic.module = torch.compile(critic.module, mode=compile_mode)
 
-    advantage = GAE(
-        gamma=cfg.agent.gamma,
-        lmbda=cfg.agent.gae_lambda,
-        value_network=critic,
-        average_gae=False,
-    )
+    use_vtrace = cfg.agent.get("use_vtrace", False)
+    if use_vtrace:
+        rho_thresh = cfg.agent.get("vtrace_rho_thresh", 1.0)
+        c_thresh = cfg.agent.get("vtrace_c_thresh", 1.0)
+        log.info("Using V-trace advantage (rho_thresh=%.1f, c_thresh=%.1f)",
+                 rho_thresh, c_thresh)
+        advantage = VTrace(
+            gamma=cfg.agent.gamma,
+            actor_network=actor,
+            value_network=critic,
+            rho_thresh=rho_thresh,
+            c_thresh=c_thresh,
+        )
+    else:
+        advantage = GAE(
+            gamma=cfg.agent.gamma,
+            lmbda=cfg.agent.gae_lambda,
+            value_network=critic,
+            average_gae=False,
+        )
 
     loss_module = ClipPPOLoss(
         actor_network=actor,

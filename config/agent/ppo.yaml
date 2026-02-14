@@ -18,6 +18,11 @@ use_disco: false              # replace PPO clip objective with discovered surro
 disco_alpha: 2             # soft-clip threshold for A >= 0 branch
 disco_beta: 0.6              # soft-clip threshold for A < 0 branch
 
+# V-trace off-policy correction (Espeholt et al., ICML 2018)
+use_vtrace: false              # use V-trace instead of GAE to correct for async sampling lag
+vtrace_rho_thresh: 1.0        # IS weight clipping for value target (ρ̄)
+vtrace_c_thresh: 1.0          # IS weight clipping for trace coefficient (c̄)
+
 # ── Network architecture ─────────────────────────────────────────────────
 hidden_sizes: [256, 256]
 activation: Tanh              # any torch.nn activation class name
