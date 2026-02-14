@@ -60,7 +60,7 @@ class NoInfoWrapper(GymnasiumWrapper):
     def reset(self, **kwargs):
         obs, _info = self.env.reset(**kwargs)
         return obs, {}
-from torchrl.envs.utils import ExplorationType, set_exploration_type
+from torchrl.envs.utils import ExplorationType, set_exploration_type, step_mdp
 
 # Project imports
 from AAMAS_Comp.agents.ppo import PPOAgent, make_ppo_models, RPOTanhNormal
@@ -309,7 +309,8 @@ def train(cfg: DictConfig) -> None:
              env.observation_spec["observation"].shape,
              env.action_spec.shape)
 
-    eval_env = make_single_env(cfg, device, obs_rms=obs_rms, dtype=network_dtype)
+    num_eval_episodes = cfg.training.get("num_eval_episodes", 5)
+    eval_env = make_parallel_env(cfg, device, num_envs=num_eval_episodes, obs_rms=obs_rms, dtype=network_dtype)
 
     # ── Build PPO modules ──────────────────────────────────────────────
     # Set RPO alpha before building models (distribution class reads it)
@@ -467,26 +468,33 @@ def train(cfg: DictConfig) -> None:
 
         # ── Evaluation ────────────────────────────────────────────────
         if collect_iter % cfg.training.eval_interval == 0:
-            with set_exploration_type(ExplorationType.DETERMINISTIC), torch.no_grad():
-                num_eval_episodes = 5
-                ep_returns = []
-                ep_lengths = []
-                
-                for _ in range(num_eval_episodes):
-                    reset_td = eval_env.reset()
-                    eval_rollout = eval_env.rollout(
-                        cfg.training.eval_rollout_steps, actor,
-                        auto_reset=False, tensordict=reset_td,
-                        break_when_any_done=True,
-                    )
-                    ep_return = eval_rollout["next", "reward"].sum().item()
-                    ep_len = eval_rollout.batch_size[0]
-                    ep_returns.append(ep_return)
-                    ep_lengths.append(ep_len)
-                    del eval_rollout
+            # Run all eval episodes in parallel: N envs step simultaneously,
+            # done_mask stops reward accumulation once each env finishes so
+            # auto-reset doesn't corrupt episode returns.
+            ep_returns = torch.zeros(num_eval_episodes, device=device)
+            ep_lengths = torch.zeros(num_eval_episodes, dtype=torch.long, device=device)
+            finished = torch.zeros(num_eval_episodes, dtype=torch.bool, device=device)
 
-                eval_reward_sum = sum(ep_returns) / len(ep_returns)
-                eval_steps = sum(ep_lengths) / len(ep_lengths)
+            with set_exploration_type(ExplorationType.DETERMINISTIC), torch.no_grad():
+                td = eval_env.reset()
+                for _ in range(cfg.training.eval_rollout_steps):
+                    td = actor(td)
+                    td = eval_env.step(td)
+
+                    reward = td["next", "reward"].squeeze(-1)
+                    done = (td["next", "terminated"] | td["next", "truncated"]).squeeze(-1)
+
+                    ep_returns += reward * ~finished
+                    ep_lengths += (~finished).long()
+                    finished = finished | done
+
+                    if finished.all():
+                        break
+
+                    td = step_mdp(td)
+
+            eval_reward_sum = ep_returns.mean().item()
+            eval_steps = ep_lengths.float().mean().item()
 
             metrics.update({
                 "eval/reward_sum": eval_reward_sum,
