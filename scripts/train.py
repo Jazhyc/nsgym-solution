@@ -42,7 +42,24 @@ from torchrl.envs import (
     StepCounter,
     TransformedEnv,
 )
-from torchrl.envs.libs.gym import GymEnv
+import gymnasium as gym
+from gymnasium import Wrapper as GymnasiumWrapper
+
+from torchrl.envs.libs.gym import GymEnv, GymWrapper
+
+
+class NoInfoWrapper(GymnasiumWrapper):
+    """Drop the info dict from step/reset — prevents unused keys (Ant reward
+    components, position/velocity diagnostics) from being serialized over IPC
+    on every environment step."""
+
+    def step(self, action):
+        obs, reward, terminated, truncated, _info = self.env.step(action)
+        return obs, reward, terminated, truncated, {}
+
+    def reset(self, **kwargs):
+        obs, _info = self.env.reset(**kwargs)
+        return obs, {}
 from torchrl.envs.utils import ExplorationType, set_exploration_type
 
 # Project imports
@@ -143,7 +160,7 @@ def initialize_obs_norm(cfg: DictConfig, device: torch.device,
     
     log.info("Bootstrapping observation normalization stats...")
     # Use a plain env (no normalization) to collect raw observations
-    base_env = GymEnv(cfg.env.id, device=device)
+    base_env = GymWrapper(NoInfoWrapper(gym.make(cfg.env.id)), device=device)
     tmp = TransformedEnv(base_env, Compose(DoubleToFloat(), StepCounter()))
     tmp.reset()
     td = tmp.rollout(max_steps=cfg.env.normalize_obs_init_steps, break_when_any_done=False)
@@ -167,14 +184,16 @@ def initialize_obs_norm(cfg: DictConfig, device: torch.device,
 
 def make_single_env(cfg: DictConfig, device: torch.device, obs_rms: RunningMeanStd | None = None, dtype: torch.dtype | None = None) -> TransformedEnv:
     """Create a single TorchRL ``TransformedEnv`` instance.
-    
+
     Args:
         cfg: Hydra config.
         device: Device for the environment.
         obs_rms: Optional RunningMeanStd with frozen stats for ObservationNorm.
         dtype: Optional dtype to cast observations to.
     """
-    base_env = GymEnv(cfg.env.id, device=device)
+    # NoInfoWrapper drops Ant's reward components + position/velocity diagnostics
+    # from the TensorDict — they're serialized over IPC every step but never used.
+    base_env = GymWrapper(NoInfoWrapper(gym.make(cfg.env.id)), device=device)
 
     transforms = []
     if obs_rms is not None:
@@ -336,6 +355,10 @@ def train(cfg: DictConfig) -> None:
     for collect_iter, tensordict_data in enumerate(collector):
         batch_frames = tensordict_data.numel()
         global_step += batch_frames
+
+        # Drop actor intermediate outputs — ClipPPOLoss recomputes them from
+        # "observation"; keeping them just wastes memory and TensorDict ops.
+        tensordict_data.exclude("loc", "scale")
 
         # ── Save raw reward for logging (before normalization) ─────────
         raw_mean_reward = tensordict_data["next", "reward"].mean().item()
