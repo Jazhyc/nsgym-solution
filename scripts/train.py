@@ -229,6 +229,12 @@ def train(cfg: DictConfig) -> None:
         network_device = resolve_device(cfg.agent.network_device)
     else:
         network_device = device
+    # Tune PyTorch intra-op threads — small MLPs on CPU benefit from fewer threads
+    # (thread-launch overhead > benefit for small matrix sizes)
+    num_threads = cfg.get("num_threads", 0)
+    if num_threads > 0:
+        torch.set_num_threads(num_threads)
+        log.info("torch.set_num_threads(%d)", num_threads)
     torch.manual_seed(cfg.seed)
     log.info(f"Device: {device} | Network Device: {network_device} | Seed: {cfg.seed}")
     log.info(f"Config:\n{OmegaConf.to_yaml(cfg)}")
@@ -271,13 +277,19 @@ def train(cfg: DictConfig) -> None:
         ret_normalizer = RewardNormalizer(device=device)
         log.info("Reward normalization enabled")
 
-    env = make_parallel_env(cfg, device, num_envs=num_envs, dtype=network_dtype,
-                            obs_rms=obs_rms)
-    log.info("Env: %s | num_envs=%d | obs=%s  act=%s", cfg.env.id, num_envs,
+    num_groups = cfg.collector.get("num_groups", 1)
+    envs_per_group = max(1, num_envs // num_groups)
+    collector_envs = [
+        make_parallel_env(cfg, device, num_envs=envs_per_group, dtype=network_dtype, obs_rms=obs_rms)
+        for _ in range(num_groups)
+    ]
+    # Use first env only for shape logging
+    env = collector_envs[0]
+    log.info("Env: %s | num_groups=%d | envs_per_group=%d | total_envs=%d | obs=%s  act=%s",
+             cfg.env.id, num_groups, envs_per_group, num_groups * envs_per_group,
              env.observation_spec["observation"].shape,
              env.action_spec.shape)
 
-    # Separate eval env (single, deterministic) to avoid ParallelEnv auto-reset artefacts
     eval_env = make_single_env(cfg, device, obs_rms=obs_rms, dtype=network_dtype)
 
     # ── Build PPO modules ──────────────────────────────────────────────
@@ -299,7 +311,7 @@ def train(cfg: DictConfig) -> None:
     # ObservationNorm is in the env transforms → observations in tensordict
     # are already normalized. Use plain actor for collection.
     collector = MultiAsyncCollector(
-        [env],
+        collector_envs,
         actor,
         frames_per_batch=cfg.collector.frames_per_batch,
         total_frames=cfg.collector.total_frames,
@@ -354,24 +366,23 @@ def train(cfg: DictConfig) -> None:
                 if tensordict_data.ndim == 1:
                     tensordict_data = td_seq.reshape(-1)
 
-        for _epoch in range(cfg.training.num_epochs):
-            # Recompute GAE each epoch (value net is being updated);
-            # V-trace was already computed once above.
-            if not use_vtrace:
-                with torch.no_grad():
-                    advantage_module(tensordict_data)
+        # Compute advantages once before the epoch loop.
+        # With only a few epochs the value net changes minimally between epochs,
+        # so recomputing GAE every epoch is not worth the extra critic forward pass.
+        if not use_vtrace:
+            with torch.no_grad():
+                advantage_module(tensordict_data)
 
-            # Flatten the data and create random permutation for mini-batch sampling
-            data_view = tensordict_data.reshape(-1)
+        data_view = tensordict_data.reshape(-1)
+        n_sub = cfg.collector.frames_per_batch // cfg.training.sub_batch_size
+
+        for _epoch in range(cfg.training.num_epochs):
             perm = torch.randperm(data_view.batch_size[0], device=device)
-            
-            n_sub = cfg.collector.frames_per_batch // cfg.training.sub_batch_size
+
             for i in range(n_sub):
-                # Sample mini-batch indices
                 idx = perm[i * cfg.training.sub_batch_size : (i + 1) * cfg.training.sub_batch_size]
                 subdata = data_view[idx]
-                
-                # Enable RPO perturbation during loss computation only
+
                 RPOTanhNormal.rpo_enabled = True
                 loss_vals = loss_module(subdata)
                 RPOTanhNormal.rpo_enabled = False
@@ -389,18 +400,16 @@ def train(cfg: DictConfig) -> None:
                 optimizer.step()
                 optimizer.zero_grad(set_to_none=True)
 
-                # Collect tensors; defer .item() to avoid per-minibatch sync
                 epoch_losses["loss_objective"].append(loss_vals["loss_objective"].detach())
                 epoch_losses["loss_critic"].append(loss_vals["loss_critic"].detach())
                 epoch_losses["loss_entropy"].append(loss_vals.get("loss_entropy", torch.tensor(0.0)).detach())
                 epoch_losses["loss_total"].append(loss_total.detach())
 
-                # Log policy entropy from the base (pre-tanh) Normal distribution
-                with torch.no_grad():
-                    dist = actor.get_dist(subdata)
-                    # Independent(Normal) — already summed over action dims
-                    base_entropy = dist.base_dist.entropy().mean()
-                    epoch_losses.setdefault("policy_entropy", []).append(base_entropy)
+        # Compute policy entropy once per collect_iter (not per mini-batch).
+        # Uses first mini-batch of data_view as a representative sample.
+        with torch.no_grad():
+            dist = actor.get_dist(data_view[:cfg.training.sub_batch_size])
+            policy_entropy = dist.base_dist.entropy().mean().item()
 
         scheduler.step()
 
@@ -416,6 +425,7 @@ def train(cfg: DictConfig) -> None:
             "train/step_count_max": max_step_count,
             "train/lr": lr_now,
             "train/global_step": global_step,
+            "train/policy_entropy": policy_entropy,
             **{f"train/{k}": v for k, v in avg_losses.items()},
         }
 
@@ -471,10 +481,11 @@ def train(cfg: DictConfig) -> None:
 
     pbar.close()
     collector.shutdown()
-    try:
-        env.close()
-    except RuntimeError:
-        pass  # Already closed by collector shutdown
+    for e in collector_envs:
+        try:
+            e.close()
+        except RuntimeError:
+            pass  # Already closed by collector shutdown
     eval_env.close()
 
     # ── Final save ─────────────────────────────────────────────────────
