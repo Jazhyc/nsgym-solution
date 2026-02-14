@@ -11,7 +11,7 @@ loss_critic_type: smooth_l1          # smooth_l1 clips large TD errors
 optimizer: adamw              # optimizer: adamw | rmsprop
 
 # RPO (Robust Policy Optimization) — changed distribution
-rpo_alpha: 0.05               # scale perturbation: σ' = σ + Uniform(0, α). 0 = disabled.
+rpo_alpha: 0               # scale perturbation: σ' = σ + Uniform(0, α). 0 = disabled.
 
 # ── Network architecture ─────────────────────────────────────────────────
 hidden_sizes: [256, 256]

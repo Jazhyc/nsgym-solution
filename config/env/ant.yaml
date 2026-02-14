@@ -1,7 +1,7 @@
 # ── Ant environment (ns-gym wrapped) ────────────────────────────────────
 id: Ant-v5
 ns_wrapper: mujoco              # mujoco | classic_control | none
-frame_skip: 1
+frame_skip: 5
 
 # Observation / reward transforms applied by TorchRL
 normalize_obs: true
