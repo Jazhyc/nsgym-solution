@@ -350,7 +350,11 @@ def train(cfg: DictConfig) -> None:
             "loss_critic": [],
             "loss_entropy": [],
             "loss_total": [],
+            "kl_approx": [],
+            "clip_fraction": [],
         }
+        target_kl = cfg.training.get("target_kl", None)
+        epochs_done = 0
 
         # Compute V-trace advantages once before epoch loop (expensive due
         # to actor forward pass; correction is for behavior→current mismatch,
@@ -378,6 +382,7 @@ def train(cfg: DictConfig) -> None:
 
         for _epoch in range(cfg.training.num_epochs):
             perm = torch.randperm(data_view.batch_size[0], device=device)
+            epoch_kl = 0.0
 
             for i in range(n_sub):
                 idx = perm[i * cfg.training.sub_batch_size : (i + 1) * cfg.training.sub_batch_size]
@@ -404,6 +409,13 @@ def train(cfg: DictConfig) -> None:
                 epoch_losses["loss_critic"].append(loss_vals["loss_critic"].detach())
                 epoch_losses["loss_entropy"].append(loss_vals.get("loss_entropy", torch.tensor(0.0)).detach())
                 epoch_losses["loss_total"].append(loss_total.detach())
+                epoch_losses["kl_approx"].append(loss_vals.get("kl_approx", torch.tensor(0.0)).detach())
+                epoch_losses["clip_fraction"].append(loss_vals.get("clip_fraction", torch.tensor(0.0)).detach())
+                epoch_kl += loss_vals.get("kl_approx", torch.tensor(0.0)).item()
+
+            epochs_done += 1
+            if target_kl is not None and (epoch_kl / n_sub) > 1.5 * target_kl:
+                break
 
         # Compute policy entropy once per collect_iter (not per mini-batch).
         # Uses first mini-batch of data_view as a representative sample.
@@ -426,6 +438,7 @@ def train(cfg: DictConfig) -> None:
             "train/lr": lr_now,
             "train/global_step": global_step,
             "train/policy_entropy": policy_entropy,
+            "train/epochs_done": epochs_done,
             **{f"train/{k}": v for k, v in avg_losses.items()},
         }
 

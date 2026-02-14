@@ -1,6 +1,6 @@
 # ── PPO agent hyper-parameters ──────────────────────────────────────────
 lr: 3.0e-4                    # SB3 default for MuJoCo PPO
-lr_min: 0.0
+lr_min: 3.0e-5                
 gamma: 0.99
 eps_clip: 1.0e-5
 gae_lambda: 0.95
