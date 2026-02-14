@@ -32,6 +32,32 @@ log = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
+# RPO (Robust Policy Optimization) changed distribution
+# ---------------------------------------------------------------------------
+
+class RPOTanhNormal(TanhNormal):
+    """TanhNormal with RPO perturbation of the scale parameter.
+
+    When ``rpo_enabled`` is True (during loss computation), adds
+    ``Uniform(0, rpo_alpha)`` noise to the scale before constructing the
+    distribution.  This makes the importance-sampling ratio more
+    conservative, improving robustness.
+
+    Reference: Liang et al., "RPO: Robust Policy Optimization"
+    """
+
+    rpo_alpha: float = 0.5
+    rpo_enabled: bool = False
+
+    def __init__(self, loc, scale, *args, **kwargs):
+        if RPOTanhNormal.rpo_enabled and RPOTanhNormal.rpo_alpha > 0:
+            # Create symmetric noise z ~ U(-alpha, alpha)
+            z = (torch.rand_like(loc) * 2 - 1) * RPOTanhNormal.rpo_alpha
+            loc = loc + z  # Add noise to mean, not scale
+        super().__init__(loc, scale, *args, **kwargs)
+
+
+# ---------------------------------------------------------------------------
 # Model factories
 # ---------------------------------------------------------------------------
 
@@ -79,7 +105,7 @@ def make_actor(
         module=policy_module,
         spec=action_spec,
         in_keys=["loc", "scale"],
-        distribution_class=TanhNormal,
+        distribution_class=RPOTanhNormal,
         distribution_kwargs=dist_kwargs,
         return_log_prob=True,
     )
@@ -178,7 +204,7 @@ def make_shared_actor_critic(
         module=policy_module,
         spec=action_spec,
         in_keys=["loc", "scale"],
-        distribution_class=TanhNormal,
+        distribution_class=RPOTanhNormal,
         distribution_kwargs=dist_kwargs,
         return_log_prob=True,
     )

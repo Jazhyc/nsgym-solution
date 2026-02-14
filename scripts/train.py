@@ -46,7 +46,7 @@ from torchrl.envs.libs.gym import GymEnv
 from torchrl.envs.utils import ExplorationType, set_exploration_type
 
 # Project imports
-from AAMAS_Comp.agents.ppo import PPOAgent, make_ppo_models
+from AAMAS_Comp.agents.ppo import PPOAgent, make_ppo_models, RPOTanhNormal
 
 log = logging.getLogger(__name__)
 
@@ -281,6 +281,12 @@ def train(cfg: DictConfig) -> None:
     eval_env = make_single_env(cfg, device, obs_rms=obs_rms, dtype=network_dtype)
 
     # ── Build PPO modules ──────────────────────────────────────────────
+    # Set RPO alpha before building models (distribution class reads it)
+    rpo_alpha = cfg.agent.get("rpo_alpha", 0.0)
+    RPOTanhNormal.rpo_alpha = rpo_alpha
+    if rpo_alpha > 0:
+        log.info("RPO enabled with alpha=%.2f", rpo_alpha)
+
     models = make_ppo_models(env, cfg, device=device, network_device=network_device, dtype=network_dtype)
     actor = models["actor"]
     advantage_module = models["advantage"]
@@ -344,7 +350,11 @@ def train(cfg: DictConfig) -> None:
                 idx = perm[i * cfg.training.sub_batch_size : (i + 1) * cfg.training.sub_batch_size]
                 subdata = data_view[idx]
                 
+                # Enable RPO perturbation during loss computation only
+                RPOTanhNormal.rpo_enabled = True
                 loss_vals = loss_module(subdata)
+                RPOTanhNormal.rpo_enabled = False
+
                 loss_total = (
                     loss_vals["loss_objective"]
                     + loss_vals["loss_critic"]
@@ -363,6 +373,13 @@ def train(cfg: DictConfig) -> None:
                 epoch_losses["loss_critic"].append(loss_vals["loss_critic"].detach())
                 epoch_losses["loss_entropy"].append(loss_vals.get("loss_entropy", torch.tensor(0.0)).detach())
                 epoch_losses["loss_total"].append(loss_total.detach())
+
+                # Log policy entropy from the base (pre-tanh) Normal distribution
+                with torch.no_grad():
+                    dist = actor.get_dist(subdata)
+                    # Independent(Normal) — already summed over action dims
+                    base_entropy = dist.base_dist.entropy().mean()
+                    epoch_losses.setdefault("policy_entropy", []).append(base_entropy)
 
         scheduler.step()
 

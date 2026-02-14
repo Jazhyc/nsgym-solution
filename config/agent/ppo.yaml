@@ -10,6 +10,9 @@ critic_coeff: 0.5            # SB3 default vf_coef
 loss_critic_type: l2          # SB3 default (MSE); smooth_l1 clips large TD errors
 optimizer: adamw              # optimizer: adamw | rmsprop
 
+# RPO (Robust Policy Optimization) — changed distribution
+rpo_alpha: 0.3               # scale perturbation: σ' = σ + Uniform(0, α). 0 = disabled.
+
 # ── Network architecture ─────────────────────────────────────────────────
 hidden_sizes: [256, 256]
 activation: Tanh              # any torch.nn activation class name
