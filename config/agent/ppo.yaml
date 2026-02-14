@@ -7,7 +7,7 @@ gae_lambda: 0.95
 clip_epsilon: 0.2
 entropy_coeff: 0.0           # SB3 default for MuJoCo (no entropy bonus)
 critic_coeff: 0.5            # SB3 default vf_coef
-loss_critic_type: l2          # SB3 default (MSE); smooth_l1 clips large TD errors
+loss_critic_type: smooth_l1          # smooth_l1 clips large TD errors
 optimizer: adamw              # optimizer: adamw | rmsprop
 
 # RPO (Robust Policy Optimization) — changed distribution
