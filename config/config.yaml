@@ -26,10 +26,10 @@ num_threads: 4
 
 # ── Training loop ──────────────────────────────────────────────────────
 training:
-  num_epochs: 10             # inner PPO optimisation epochs per batch (KL stopping prevents instability)
+  num_epochs: 5             # inner PPO optimisation epochs per batch (KL stopping prevents instability)
   sub_batch_size: 256           # mini-batch size inside each epoch
   max_grad_norm: 1
-  target_kl: 0.015           # stop epochs early if mean KL exceeds this; null to disable
+  target_kl: 0.02           # stop epochs early if mean KL exceeds this; null to disable; 0.015 SB3 default
   eval_interval: 128           # evaluate every N collector iteration
   eval_rollout_steps: 1000    # max steps per eval episode (vectorized over num_eval_episodes envs)
   num_eval_episodes: 8        # parallel eval envs; all run simultaneously to avoid sequential hiccup
