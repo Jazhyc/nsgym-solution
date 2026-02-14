@@ -16,7 +16,7 @@ from typing import Any, Dict, Sequence
 import numpy as np
 import torch
 from omegaconf import DictConfig
-from tensordict.nn import TensorDictModule
+from tensordict.nn import TensorDictModule, TensorDictParams
 from tensordict.nn.distributions import NormalParamExtractor
 from torch import nn
 
@@ -29,6 +29,126 @@ from AAMAS_Comp.agents.networks import make_mlp
 from AAMAS_Comp.base_agent import ModelFreeAgent
 
 log = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# DiscoPO loss (Lu et al., NeurIPS 2022)
+# ---------------------------------------------------------------------------
+
+class DiscoPOLoss(ClipPPOLoss):
+    """Discovered Policy Optimization surrogate objective.
+
+    Replaces the clipped PPO actor loss with the piecewise surrogate
+    discovered by Lu et al. (NeurIPS 2022)::
+
+        f(r, A) = ReLU((r-1)*A - α*tanh((r-1)*A/α))   if A >= 0
+                  ReLU(log(r)*A - β*tanh(log(r)*A/β))  if A <  0
+
+    The critic loss, entropy bonus, and advantage normalisation are
+    inherited unchanged from ``ClipPPOLoss``.
+    """
+
+    # Re-declare annotations so TorchRL's LossModule registers params correctly
+    actor_network: "TensorDictModule"
+    critic_network: "TensorDictModule"
+    actor_network_params: "TensorDictParams"
+    critic_network_params: "TensorDictParams"
+    target_actor_network_params: "TensorDictParams"
+    target_critic_network_params: "TensorDictParams"
+
+    def __init__(self, *args, disco_alpha: float = 2.0, disco_beta: float = 0.6, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.disco_alpha = disco_alpha
+        self.disco_beta = disco_beta
+
+    def forward(self, tensordict):
+        from tensordict import TensorDict
+        from torchrl.objectives.utils import _reduce
+
+        tensordict = tensordict.clone(False)
+
+        # ── Advantage (reuse parent's normalisation logic) ────────────
+        advantage = tensordict.get(self.tensor_keys.advantage, None, as_padded_tensor=True)
+        if advantage is None:
+            self.value_estimator(
+                tensordict,
+                params=self._cached_critic_network_params_detached,
+                target_params=self.target_critic_network_params,
+            )
+            advantage = tensordict.get(self.tensor_keys.advantage)
+        if self.normalize_advantage and advantage.numel() > 1:
+            loc = advantage.mean()
+            scale = advantage.std().clamp_min(1e-8)
+            advantage = (advantage - loc) / scale
+
+        # ── Importance-sampling ratio (from parent) ───────────────────
+        log_weight, dist, kl_approx = self._log_weight(
+            tensordict, adv_shape=advantage.shape[:-1]
+        )
+        # log_weight shape: (*batch, 1)  — squeeze trailing dim
+        log_ratio = log_weight.squeeze(-1)
+        ratio = log_ratio.exp()
+        adv = advantage.squeeze(-1)
+
+        # ── DiscoPO piecewise surrogate ───────────────────────────────
+        # f(r,A) is the clipping penalty; full objective is r*A - f(r,A)
+        alpha, beta = self.disco_alpha, self.disco_beta
+
+        # A >= 0 branch: clip = ReLU((r-1)*A - α*tanh((r-1)*A / α))
+        u = (ratio - 1.0) * adv
+        f_pos = torch.relu(u - alpha * torch.tanh(u / alpha))
+
+        # A < 0 branch:  clip = ReLU(log(r)*A - β*tanh(log(r)*A / β))
+        v = log_ratio * adv
+        f_neg = torch.relu(v - beta * torch.tanh(v / beta))
+
+        clip_penalty = torch.where(adv >= 0, f_pos, f_neg)
+        gain = ratio * adv - clip_penalty
+
+        # ── ESS for logging ───────────────────────────────────────────
+        with torch.no_grad():
+            lw = log_weight.squeeze()
+            ess = (2 * lw.logsumexp(0) - (2 * lw).logsumexp(0)).exp()
+            batch = log_weight.shape[0]
+            clip_fraction = torch.zeros((), device=gain.device)  # not applicable
+
+        td_out = TensorDict({"loss_objective": -gain})
+        td_out.set("clip_fraction", clip_fraction)
+        td_out.set("kl_approx", kl_approx.detach().mean())
+
+        # ── Entropy bonus (inherited) ─────────────────────────────────
+        if self.entropy_bonus:
+            entropy = self._get_entropy(dist, adv_shape=advantage.shape[:-1])
+            from tensordict.utils import is_tensor_collection
+            if is_tensor_collection(entropy):
+                from torchrl.objectives.ppo import _sum_td_features
+                td_out.set("composite_entropy", entropy.detach())
+                td_out.set("entropy", _sum_td_features(entropy).detach().mean())
+            else:
+                td_out.set("entropy", entropy.detach().mean())
+            td_out.set("loss_entropy", self._weighted_loss_entropy(entropy))
+
+        # ── Critic loss (inherited) ───────────────────────────────────
+        if self._has_critic:
+            loss_critic, value_clip_fraction, explained_variance = self.loss_critic(tensordict)
+            td_out.set("loss_critic", loss_critic)
+            if value_clip_fraction is not None:
+                td_out.set("value_clip_fraction", value_clip_fraction)
+            if explained_variance is not None:
+                td_out.set("explained_variance", explained_variance)
+
+        td_out.set("ESS", _reduce(ess, self.reduction) / batch)
+        td_out = td_out.named_apply(
+            lambda name, value: _reduce(value, reduction=self.reduction).squeeze(-1)
+            if name.startswith("loss_")
+            else value,
+        )
+        self._clear_weakrefs(
+            tensordict, td_out,
+            "actor_network_params", "critic_network_params",
+            "target_actor_network_params", "target_critic_network_params",
+        )
+        return td_out
 
 
 # ---------------------------------------------------------------------------
@@ -302,6 +422,24 @@ def make_ppo_models(
         loss_critic_type=cfg.agent.loss_critic_type,
         normalize_advantage=True,
     )
+
+    # Optionally swap in the DiscoPO surrogate objective
+    if cfg.agent.get("use_disco", False):
+        disco_alpha = cfg.agent.get("disco_alpha", 2.0)
+        disco_beta = cfg.agent.get("disco_beta", 0.6)
+        log.info("Using DiscoPO loss (alpha=%.2f, beta=%.2f)", disco_alpha, disco_beta)
+        loss_module = DiscoPOLoss(
+            actor_network=actor,
+            critic_network=critic,
+            clip_epsilon=cfg.agent.clip_epsilon,
+            entropy_bonus=cfg.agent.entropy_coeff > 0,
+            entropy_coeff=cfg.agent.entropy_coeff,
+            critic_coeff=cfg.agent.critic_coeff,
+            loss_critic_type=cfg.agent.loss_critic_type,
+            normalize_advantage=True,
+            disco_alpha=disco_alpha,
+            disco_beta=disco_beta,
+        )
 
     # Deduplicate params (shared trunk params appear in both actor & critic)
     optim_params = list({id(p): p for p in loss_module.parameters()}.values())

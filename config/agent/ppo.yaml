@@ -13,6 +13,11 @@ optimizer: adamw              # optimizer: adamw | rmsprop
 # RPO (Robust Policy Optimization) — changed distribution
 rpo_alpha: 0               # scale perturbation: σ' = σ + Uniform(0, α). 0 = disabled.
 
+# Discovered Policy Optimization (Lu et al., NeurIPS 2022)
+use_disco: true              # replace PPO clip objective with discovered surrogate
+disco_alpha: 2             # soft-clip threshold for A >= 0 branch
+disco_beta: 0.6              # soft-clip threshold for A < 0 branch
+
 # ── Network architecture ─────────────────────────────────────────────────
 hidden_sizes: [256, 256]
 activation: Tanh              # any torch.nn activation class name
