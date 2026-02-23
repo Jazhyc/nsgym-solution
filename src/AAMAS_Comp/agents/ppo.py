@@ -20,6 +20,9 @@ from tensordict.nn import TensorDictModule, TensorDictParams
 from tensordict.nn.distributions import NormalParamExtractor
 from torch import nn
 
+from torch.distributions import OneHotCategorical
+
+from torchrl.data import OneHot
 from torchrl.envs import EnvBase
 from torchrl.modules import ProbabilisticActor, TanhNormal, ValueOperator
 from torchrl.objectives import ClipPPOLoss
@@ -256,6 +259,49 @@ def make_critic(
     return critic
 
 
+def make_discrete_actor(
+    obs_dim: int,
+    n_actions: int,
+    hidden_sizes: Sequence[int],
+    activation: str,
+    device: torch.device | str,
+    action_spec: Any | None = None,
+    dtype: torch.dtype | None = None,
+) -> ProbabilisticActor:
+    """Build a stochastic Categorical actor for discrete action spaces.
+
+    The network outputs logits of shape ``(n_actions,)`` consumed by a
+    ``Categorical`` distribution.  Compatible with ``ClipPPOLoss``.
+    """
+    mlp = make_mlp(
+        in_features=obs_dim,
+        out_features=n_actions,
+        hidden_sizes=hidden_sizes,
+        activation=activation,
+        device=device,
+        dtype=dtype,
+        ortho_init=True,
+        output_gain=0.01,
+    )
+    # Wrap in Sequential so actor.module[0] == mlp (consistent with continuous actor)
+    net = nn.Sequential(mlp)
+
+    policy_module = TensorDictModule(
+        net,
+        in_keys=["observation"],
+        out_keys=["logits"],
+    )
+
+    actor = ProbabilisticActor(
+        module=policy_module,
+        spec=action_spec,
+        in_keys=["logits"],
+        distribution_class=OneHotCategorical,
+        return_log_prob=True,
+    )
+    return actor
+
+
 def make_shared_actor_critic(
     obs_dim: int,
     act_dim: int,
@@ -361,17 +407,45 @@ def make_ppo_models(
             network_device = cfg.agent.network_device
         else:
             network_device = device
-    
+
     network_device = torch.device(network_device) if isinstance(network_device, str) else network_device
+
+    # Detect discrete vs continuous action space.
+    # TorchRL wraps gym.spaces.Discrete as OneHot(n) with shape=(n,).
+    action_spec_unbatched = env.action_spec_unbatched
+    is_discrete_action = isinstance(action_spec_unbatched, OneHot)
+
     obs_dim = env.observation_spec["observation"].shape[-1]
-    act_dim = env.action_spec.shape[-1]
+    act_dim = action_spec_unbatched.shape[-1]  # n for OneHot, act_dim for continuous
+    if is_discrete_action:
+        log.info("Discrete action space detected (n=%d)", act_dim)
+
     hidden_sizes = list(cfg.agent.hidden_sizes)
     activation = cfg.agent.activation
     share_trunk = cfg.agent.get("share_trunk", False)
     compile_enabled = cfg.agent.get("compile", False)
     compile_mode = cfg.agent.get("compile_mode", "default") if compile_enabled else None
 
-    if share_trunk:
+    if is_discrete_action:
+        if share_trunk:
+            log.warning("share_trunk=true is not supported for discrete action spaces; using separate networks")
+        actor = make_discrete_actor(
+            obs_dim=obs_dim,
+            n_actions=act_dim,
+            hidden_sizes=hidden_sizes,
+            activation=activation,
+            device=network_device,
+            action_spec=action_spec_unbatched,
+            dtype=dtype,
+        )
+        critic = make_critic(
+            obs_dim=obs_dim,
+            hidden_sizes=hidden_sizes,
+            activation=activation,
+            device=network_device,
+            dtype=dtype,
+        )
+    elif share_trunk:
         log.info("Using shared actor-critic trunk")
         actor, critic = make_shared_actor_critic(
             obs_dim=obs_dim,
@@ -379,7 +453,7 @@ def make_ppo_models(
             hidden_sizes=hidden_sizes,
             activation=activation,
             device=network_device,
-            action_spec=env.action_spec_unbatched,
+            action_spec=action_spec_unbatched,
             dtype=dtype,
         )
     else:
@@ -389,7 +463,7 @@ def make_ppo_models(
             hidden_sizes=hidden_sizes,
             activation=activation,
             device=network_device,
-            action_spec=env.action_spec_unbatched,
+            action_spec=action_spec_unbatched,
             dtype=dtype,
         )
         critic = make_critic(

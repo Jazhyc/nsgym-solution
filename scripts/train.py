@@ -34,6 +34,7 @@ warnings.filterwarnings("ignore", category=FutureWarning, module="torchrl.module
 
 # TorchRL imports
 from torchrl.collectors import MultiAsyncCollector
+from torchrl.data import OneHot, UnboundedContinuous
 from torchrl.envs import (
     Compose,
     DoubleToFloat,
@@ -42,10 +43,38 @@ from torchrl.envs import (
     StepCounter,
     TransformedEnv,
 )
+from torchrl.envs.transforms import Transform
 import gymnasium as gym
 from gymnasium import Wrapper as GymnasiumWrapper
 
 from torchrl.envs.libs.gym import GymEnv, GymWrapper
+
+
+class DiscreteObsToFloat(Transform):
+    """Cast a one-hot discrete observation from int64 to float32.
+
+    TorchRL's GymWrapper already converts gym.spaces.Discrete observations to
+    one-hot integer tensors of shape (n,).  This transform casts them to
+    float32 so they can be fed directly into an MLP.
+    """
+
+    def __init__(self):
+        super().__init__(in_keys=["observation"], out_keys=["observation"])
+
+    def _apply_transform(self, obs: torch.Tensor) -> torch.Tensor:
+        return obs.float()
+
+    def _reset(self, tensordict, tensordict_reset):
+        # Base Transform._reset does NOT call _apply_transform; call it explicitly.
+        return self._call(tensordict_reset)
+
+    def transform_observation_spec(self, observation_spec):
+        spec = observation_spec["observation"]
+        observation_spec["observation"] = UnboundedContinuous(
+            shape=spec.shape,
+            dtype=torch.float32,
+        )
+        return observation_spec
 
 
 class NoInfoWrapper(GymnasiumWrapper):
@@ -196,7 +225,14 @@ def make_single_env(cfg: DictConfig, device: torch.device, obs_rms: RunningMeanS
     base_env = GymWrapper(NoInfoWrapper(gym.make(cfg.env.id)), device=device)
 
     transforms = []
-    if obs_rms is not None:
+    obs_spec = base_env.observation_spec["observation"]
+    # TorchRL wraps gym.spaces.Discrete as OneHot(n) with int64 dtype.
+    # Cast to float32 so the MLP can consume it directly.
+    is_discrete_obs = isinstance(obs_spec, OneHot)
+
+    if is_discrete_obs:
+        transforms.append(DiscreteObsToFloat())
+    elif obs_rms is not None:
         obs_norm = ObservationNorm(in_keys=["observation"], standard_normal=True)
         # Materialise lazy buffers with frozen stats from bootstrap
         obs_norm.loc = torch.nn.Parameter(obs_rms.mean.float().clone(), requires_grad=False)
@@ -239,7 +275,7 @@ def resolve_device(device_str: str) -> torch.device:
 # Main training function
 # ---------------------------------------------------------------------------
 
-@hydra.main(version_base=None, config_path="../config", config_name="config")
+@hydra.main(version_base=None, config_path="../config", config_name="config_ant")
 def train(cfg: DictConfig) -> None:
     # ── Resolve device & seed ──────────────────────────────────────────
     device = resolve_device(cfg.device)
@@ -359,7 +395,10 @@ def train(cfg: DictConfig) -> None:
 
         # Drop actor intermediate outputs — ClipPPOLoss recomputes them from
         # "observation"; keeping them just wastes memory and TensorDict ops.
-        tensordict_data.exclude("loc", "scale")
+        # Covers both continuous (loc, scale) and discrete (logits) policies.
+        keys_to_drop = [k for k in ("loc", "scale", "logits") if k in tensordict_data.keys()]
+        if keys_to_drop:
+            tensordict_data.exclude(*keys_to_drop)
 
         # ── Save raw reward for logging (before normalization) ─────────
         raw_mean_reward = tensordict_data["next", "reward"].mean().item()
@@ -445,7 +484,10 @@ def train(cfg: DictConfig) -> None:
         # Uses first mini-batch of data_view as a representative sample.
         with torch.no_grad():
             dist = actor.get_dist(data_view[:cfg.training.sub_batch_size])
-            policy_entropy = dist.base_dist.entropy().mean().item()
+            # Continuous: dist is a transformed dist with base_dist (e.g. TanhNormal)
+            # Discrete:   dist is a Categorical with no base_dist
+            inner = getattr(dist, "base_dist", dist)
+            policy_entropy = inner.entropy().mean().item()
 
         scheduler.step()
 

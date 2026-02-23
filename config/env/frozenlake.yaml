@@ -1,0 +1,9 @@
+# ── FrozenLake environment ───────────────────────────────────────────────────
+id: FrozenLake-v1
+frame_skip: 1
+
+# FrozenLake has a discrete integer observation (0–15 for the 4×4 grid).
+# The training script detects this and applies one-hot encoding automatically.
+# Set normalize_obs: false — normalizing integer states is meaningless.
+normalize_obs: false
+normalize_reward: false   # Rewards are binary (0 or 1); no scaling needed

@@ -1,7 +1,8 @@
 # ── CartPole environment ────────────────────────────────────────────────
 id: CartPole-v1
-ns_wrapper: classic_control
 frame_skip: 1
 
+# CartPole has a continuous 4-D observation; normalization helps.
 normalize_obs: true
 normalize_obs_init_steps: 1000
+normalize_reward: false   # Rewards are +1 per step; no scaling needed
