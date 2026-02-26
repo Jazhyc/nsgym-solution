@@ -6,7 +6,7 @@ See example_submission.py for an example.
 """
 
 from pathlib import Path
-from AAMAS_Comp.agent import MyModelBasedAgent, ModelFreeAgent
+from AAMAS_Comp.agent import MyModelBasedAgent, ModelFreeAgent, MyModelFreeAgent
 import gymnasium as gym
 
 
@@ -23,23 +23,22 @@ def get_agent(env_id: str):
         Agent: Your initialized agent object.
     """
     if env_id == "Ant-v5":
-
         ####################
         ## YOUR CODE HERE ##
         ####################
-        raise NotImplementedError(f"Sumbission not implemented for {env_id}")
+        return MyModelFreeAgent("models/ppo_ant/ppo_final.pt", device="cuda")
 
     elif env_id == "FrozenLake-v1":
         ####################
         ## YOUR CODE HERE ##
         ####################
-        raise NotImplementedError(f"Sumbission not implemented for {env_id}")
+        return MyModelFreeAgent("models/ppo_frozenlake/ppo_final.pt", device="cpu")
 
     elif env_id == "CartPole-v1":
         ####################
         ## YOUR CODE HERE ##
         ####################
-        raise NotImplementedError(f"Sumbission not implemented for {env_id}")
+        return MyModelFreeAgent("models/ppo_cartpole/ppo_final.pt", device="cpu")
 
     else:
         raise ValueError(f"{env_id} not in: Ant-v5, FrozenLake-v1, CartPole-v1")

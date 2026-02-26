@@ -591,11 +591,11 @@ class PPOAgent(ModelFreeAgent):
         # Store obs normalisation stats (mean / std tensors)
         if obs_rms is not None:
             if hasattr(obs_rms, "mean"):  # RunningMeanStd object
-                self._obs_mean = obs_rms.mean.clone().to(self.device)
-                self._obs_std = obs_rms.std.clone().to(self.device)
+                self._obs_mean = obs_rms.mean.clone().to(self.device).float()
+                self._obs_std = obs_rms.std.clone().to(self.device).float()
             elif isinstance(obs_rms, dict):  # loaded from checkpoint
-                self._obs_mean = obs_rms["mean"].to(self.device)
-                self._obs_std = obs_rms["std"].to(self.device)
+                self._obs_mean = obs_rms["mean"].to(self.device).float()
+                self._obs_std = obs_rms["std"].to(self.device).float()
             else:
                 self._obs_mean = None
                 self._obs_std = None

@@ -213,5 +213,6 @@ results/
 logs/
 checkpoints/
 !config/env
-
+*.pt
+.vscode
 
