@@ -29,6 +29,8 @@ from tqdm import tqdm
 
 import wandb
 
+from AAMAS_Comp.optimizers.cbp import ContinualBackpropagation
+
 # Suppress FutureWarnings from torchrl (Python 3.13 compatibility issues)
 warnings.filterwarnings("ignore", category=FutureWarning, module="torchrl.modules.mcts.scores")
 
@@ -362,6 +364,23 @@ def train(cfg: DictConfig) -> None:
     optimizer = models["optimizer"]
     scheduler = models["scheduler"]
     optim_params = models["optim_params"]
+
+    # ── Continual Backpropagation (optional) ──────────────────────────
+    cbp = None
+    cbp_cfg = cfg.agent.get("cbp", None)
+    if cbp_cfg and cbp_cfg.get("enabled", False):
+        cbp = ContinualBackpropagation(
+            model=loss_module,          # wraps actor + critic weights
+            optimizer=optimizer,
+            reset_rate=cbp_cfg.get("reset_rate", 0.01),
+            maturity_threshold=cbp_cfg.get("maturity_threshold", 50),
+            utility_decay=cbp_cfg.get("utility_decay", 0.05),
+            reset_init=cbp_cfg.get("reset_init", "uniform"),
+            momentum=cbp_cfg.get("momentum", 0.9),
+            device=network_device,
+        )
+        log.info("CBP enabled — reset_rate=%.3f  maturity_threshold=%d",
+                 cbp_cfg.reset_rate, cbp_cfg.maturity_threshold)
     
     # ── Data collector ─────────────────────────────────────────────────
     # ObservationNorm is in the env transforms → observations in tensordict
@@ -467,6 +486,9 @@ def train(cfg: DictConfig) -> None:
                 )
                 optimizer.step()
                 optimizer.zero_grad(set_to_none=True)
+
+                if cbp is not None:
+                    cbp.step(global_step)
 
                 epoch_losses["loss_objective"].append(loss_vals["loss_objective"].detach())
                 epoch_losses["loss_critic"].append(loss_vals["loss_critic"].detach())

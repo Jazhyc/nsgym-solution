@@ -52,3 +52,11 @@ wandb:
   tags: []
   mode: online                # online | offline | disabled
   dir: logs/wandb             # local directory for wandb logs
+
+cbp:
+  enabled: false
+  reset_rate: 0.01
+  maturity_threshold: 50
+  utility_decay: 0.05
+  reset_init: uniform   # uniform | normal | constant
+  momentum: 0.9
