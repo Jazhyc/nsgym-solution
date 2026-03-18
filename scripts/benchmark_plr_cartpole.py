@@ -29,6 +29,7 @@ import gymnasium as gym
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from src.AAMAS_Comp.envs import NS_ENV_SAMPLERS, NSEnvFactory, NS_ENV_CONFIGS
+from src.AAMAS_Comp.envs.fast_ns_wrapper import FastNSClassicControlWrapper
 from src.AAMAS_Comp.curriculum import PLRBuffer, td_error_score
 
 
@@ -118,7 +119,35 @@ def bench_ns_fixed(n_episodes: int) -> dict:
 
     total_steps = sum(steps_list)
     return {
-        "label":          "NS CartPole, fixed config (wrapper overhead only)",
+        "label":          "NS CartPole, stock wrapper (fixed config)",
+        "n_episodes":     n_episodes,
+        "total_steps":    total_steps,
+        "elapsed_s":      elapsed,
+        "sps":            total_steps / elapsed,
+        "mean_length":    float(np.mean(steps_list)),
+        "mean_return":    float(np.mean(return_list)),
+    }
+
+
+def bench_fast_ns_fixed(n_episodes: int) -> dict:
+    """FastNSClassicControlWrapper with same config — measures how much overhead we recover."""
+    config = NS_ENV_CONFIGS["cartpole_multi_param"]()
+    base_env = gym.make(config.env_id)
+    tunable = {name: pc.build() for name, pc in config.tunable_params.items()}
+    env = FastNSClassicControlWrapper(base_env, tunable)
+    steps_list, return_list = [], []
+
+    t0 = time.perf_counter()
+    for _ in range(n_episodes):
+        s, r = run_episode_stationary(env)
+        steps_list.append(s)
+        return_list.append(r)
+    elapsed = time.perf_counter() - t0
+    env.close()
+
+    total_steps = sum(steps_list)
+    return {
+        "label":          "NS CartPole, fast wrapper (fixed config)",
         "n_episodes":     n_episodes,
         "total_steps":    total_steps,
         "elapsed_s":      elapsed,
@@ -280,16 +309,19 @@ def main():
 
     results = []
 
-    print("  [1/4] Stationary baseline...")
+    print("  [1/5] Stationary baseline...")
     results.append(bench_stationary(args.n_episodes))
 
-    print("  [2/4] NS CartPole, fixed config...")
+    print("  [2/5] NS CartPole, stock wrapper...")
     results.append(bench_ns_fixed(args.n_episodes))
 
-    print("  [3/4] NS CartPole + PLR...")
+    print("  [3/5] NS CartPole, fast wrapper...")
+    results.append(bench_fast_ns_fixed(args.n_episodes))
+
+    print("  [4/5] NS CartPole + PLR...")
     results.append(bench_plr(args.n_episodes, args.plr_capacity, args.replay_prob, args.seed))
 
-    print(f"  [4/4] Parallel throughput ceiling ({args.n_envs}× AsyncVectorEnv)...")
+    print(f"  [5/5] Parallel throughput ceiling ({args.n_envs}× AsyncVectorEnv)...")
     results.append(bench_parallel(args.n_episodes, args.n_envs))
 
     # ── Results ───────────────────────────────────────────────────────────────
