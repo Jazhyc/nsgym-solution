@@ -50,7 +50,7 @@ agent:
 # ── Weights & Biases ─────────────────────────────────────────────────────────
 wandb:
   enabled: true
-  project: aamas-ppo
+  project: aamas-ppo-frozenlake
   entity: null
   group: null
   name: null
