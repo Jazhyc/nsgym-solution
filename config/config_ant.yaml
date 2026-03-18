@@ -45,7 +45,7 @@ device: cpu                   # device for collector/env (cpu | cuda | auto)
 # ── Weights & Biases ───────────────────────────────────────────────────
 wandb:
   enabled: true
-  project: aamas-ppo
+  project: aamas-ppo-plr
   entity: null                # set to your wandb team / username
   group: null
   name: null                  # auto-generated if null
