@@ -237,7 +237,6 @@ ANT_PARAM_SPECS: list[ParamSpec] = [
         param_name="gravity",
         schedulers=_ALL_SCHEDULERS,
         update_fns=[
-            "NoUpdate",
             "IncrementUpdate", "DecrementUpdate", "RandomWalk",
             "RandomWalkWithDrift", "DeterministicTrend", "OscillatingUpdate",
             "OrnsteinUhlenbeck", "BoundedRandomWalk", "LinearInterpolation",
@@ -263,7 +262,6 @@ ANT_PARAM_SPECS: list[ParamSpec] = [
         param_name="torso_mass",
         schedulers=_ALL_SCHEDULERS,
         update_fns=[
-            "NoUpdate",
             "IncrementUpdate", "DecrementUpdate", "ExponentialDecay",
             "GeometricProgression", "RandomWalk",
             "OrnsteinUhlenbeck", "BoundedRandomWalk", "LinearInterpolation",
@@ -297,7 +295,6 @@ CARTPOLE_PARAM_SPECS: list[ParamSpec] = [
         param_name="masspole",
         schedulers=_ALL_SCHEDULERS,
         update_fns=[
-            "NoUpdate",
             "IncrementUpdate", "DecrementUpdate", "ExponentialDecay",
             "GeometricProgression", "RandomWalk",
             "OrnsteinUhlenbeck", "BoundedRandomWalk",
@@ -321,7 +318,6 @@ CARTPOLE_PARAM_SPECS: list[ParamSpec] = [
         param_name="gravity",
         schedulers=_ALL_SCHEDULERS,
         update_fns=[
-            "NoUpdate",
             "IncrementUpdate", "DecrementUpdate", "RandomWalk",
             "RandomWalkWithDrift", "DeterministicTrend", "OscillatingUpdate",
             "OrnsteinUhlenbeck", "BoundedRandomWalk",
@@ -372,11 +368,15 @@ NS_ENV_SAMPLERS: dict[str, callable] = {
         param_specs=CARTPOLE_PARAM_SPECS,
         seed=seed,
     ),
+    # FrozenLake-v1 default is is_slippery=True → transition dist [1/3, 1/3, 1/3].
+    # The competition starts from this default, so we match it here.
+    # The original code used [1,0,0] (deterministic), which was wrong and caused
+    # PLR to train exclusively on near-deterministic dynamics.
     "frozenlake": lambda seed=None: NSEnvSampler(
         env_id="FrozenLake-v1",
         param_specs=FROZENLAKE_PARAM_SPECS,
         gym_kwargs={"disable_env_checker": True},
-        wrapper_kwargs={"initial_prob_dist": [1, 0, 0]},
+        wrapper_kwargs={"initial_prob_dist": [1/3, 1/3, 1/3]},
         seed=seed,
     ),
 }
