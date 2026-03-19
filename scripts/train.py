@@ -95,6 +95,7 @@ from torchrl.envs.utils import ExplorationType, set_exploration_type, step_mdp
 
 # Project imports
 from AAMAS_Comp.agents.ppo import PPOAgent, make_ppo_models, RPOTanhNormal
+from AAMAS_Comp.curriculum import PLREnv, FixedNSEnv, sample_held_out_configs
 
 log = logging.getLogger(__name__)
 
@@ -250,7 +251,7 @@ def make_single_env(cfg: DictConfig, device: torch.device, obs_rms: RunningMeanS
 def make_parallel_env(cfg: DictConfig, device: torch.device, num_envs: int = 1, dtype: torch.dtype | None = None, obs_rms: RunningMeanStd | None = None) -> TransformedEnv | ParallelEnv:
     """Create vectorized parallel environments."""
     from functools import partial
-    
+
     if num_envs == 1:
         env = make_single_env(cfg, device, obs_rms=obs_rms, dtype=dtype)
     else:
@@ -259,8 +260,102 @@ def make_parallel_env(cfg: DictConfig, device: torch.device, num_envs: int = 1, 
             create_env_fn=partial(make_single_env, cfg, device, obs_rms, dtype),
             serial_for_single=True,
         )
-    
+
     return env
+
+
+def make_ns_plr_env(cfg: DictConfig, device: torch.device, obs_rms: RunningMeanStd | None = None, dtype: torch.dtype | None = None) -> TransformedEnv:
+    """Create a PLREnv-backed TorchRL TransformedEnv for NS training.
+
+    Each call produces an independent env with its own PLRBuffer — safe to
+    run in separate ParallelEnv subprocesses.  Episode return is used as the
+    PLR score proxy (TD-error scoring would need critic values from the
+    training loop, which are not available inside the env).
+    """
+    plr_cfg = cfg.env.plr
+    plr_env = PLREnv(
+        sampler_key=plr_cfg.sampler_key,
+        plr_capacity=plr_cfg.capacity,
+        replay_prob=plr_cfg.replay_prob,
+        score_temp=plr_cfg.score_temp,
+        staleness_coef=plr_cfg.staleness_coef,
+        seed=None,  # None → OS entropy, so each worker explores different configs
+    )
+    base_env = GymWrapper(NoInfoWrapper(plr_env), device=device)
+
+    transforms = []
+    obs_spec = base_env.observation_spec["observation"]
+    is_discrete_obs = isinstance(obs_spec, OneHot)
+
+    if is_discrete_obs:
+        transforms.append(DiscreteObsToFloat())
+    elif obs_rms is not None:
+        obs_norm = ObservationNorm(in_keys=["observation"], standard_normal=True)
+        obs_norm.loc = torch.nn.Parameter(obs_rms.mean.float().clone(), requires_grad=False)
+        obs_norm.scale = torch.nn.Parameter(obs_rms.std.float().clone(), requires_grad=False)
+        transforms.append(obs_norm)
+    transforms.append(DoubleToFloat())
+    transforms.append(StepCounter())
+
+    return TransformedEnv(base_env, Compose(*transforms))
+
+
+def make_fixed_ns_eval_env(config, cfg: DictConfig, device: torch.device, obs_rms: RunningMeanStd | None = None, dtype: torch.dtype | None = None) -> TransformedEnv:
+    """Create a fixed-config NS env for held-out evaluation.
+
+    The config is pre-sampled once at training startup and never changes,
+    giving a consistent eval signal across the entire training run.
+    """
+    fixed_env = FixedNSEnv(config)
+    base_env = GymWrapper(NoInfoWrapper(fixed_env), device=device)
+
+    transforms = []
+    obs_spec = base_env.observation_spec["observation"]
+    is_discrete_obs = isinstance(obs_spec, OneHot)
+
+    if is_discrete_obs:
+        transforms.append(DiscreteObsToFloat())
+    elif obs_rms is not None:
+        obs_norm = ObservationNorm(in_keys=["observation"], standard_normal=True)
+        obs_norm.loc = torch.nn.Parameter(obs_rms.mean.float().clone(), requires_grad=False)
+        obs_norm.scale = torch.nn.Parameter(obs_rms.std.float().clone(), requires_grad=False)
+        transforms.append(obs_norm)
+    transforms.append(DoubleToFloat())
+    transforms.append(StepCounter())
+
+    return TransformedEnv(base_env, Compose(*transforms))
+
+
+def make_ns_eval_env(cfg: DictConfig, device: torch.device, obs_rms: RunningMeanStd | None = None, dtype: torch.dtype | None = None) -> TransformedEnv | ParallelEnv:
+    """Build the held-out eval env for PLR runs.
+
+    Samples `plr.num_eval_configs` NS configs once using `plr.eval_seed`,
+    then creates `num_eval_episodes` parallel envs cycling through those configs.
+    The configs never change — this gives a stable eval signal.
+    """
+    from functools import partial
+
+    plr_cfg = cfg.env.plr
+    num_eval = cfg.training.num_eval_episodes
+
+    held_out = sample_held_out_configs(
+        sampler_key=plr_cfg.sampler_key,
+        n_configs=plr_cfg.num_eval_configs,
+        seed=plr_cfg.eval_seed,
+    )
+
+    factories = [
+        partial(make_fixed_ns_eval_env, held_out[i % len(held_out)], cfg, device, obs_rms, dtype)
+        for i in range(num_eval)
+    ]
+
+    if num_eval == 1:
+        return factories[0]()
+    return ParallelEnv(
+        num_workers=num_eval,
+        create_env_fn=factories,
+        serial_for_single=True,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -336,19 +431,42 @@ def train(cfg: DictConfig) -> None:
 
     num_groups = cfg.collector.get("num_groups", 1)
     envs_per_group = max(1, num_envs // num_groups)
-    collector_envs = [
-        make_parallel_env(cfg, device, num_envs=envs_per_group, dtype=network_dtype, obs_rms=obs_rms)
-        for _ in range(num_groups)
-    ]
+    plr_enabled = cfg.env.get("plr", {}).get("enabled", False)
+
+    if plr_enabled:
+        from functools import partial
+        collector_envs = [
+            ParallelEnv(
+                num_workers=envs_per_group,
+                create_env_fn=partial(make_ns_plr_env, cfg, device, obs_rms, network_dtype),
+                serial_for_single=True,
+            )
+            for _ in range(num_groups)
+        ]
+    else:
+        collector_envs = [
+            make_parallel_env(cfg, device, num_envs=envs_per_group, dtype=network_dtype, obs_rms=obs_rms)
+            for _ in range(num_groups)
+        ]
+
     # Use first env only for shape logging
     env = collector_envs[0]
-    log.info("Env: %s | num_groups=%d | envs_per_group=%d | total_envs=%d | obs=%s  act=%s",
-             cfg.env.id, num_groups, envs_per_group, num_groups * envs_per_group,
-             env.observation_spec["observation"].shape,
-             env.action_spec.shape)
+    log.info(
+        "Env: %s | PLR=%s | num_groups=%d | envs_per_group=%d | total_envs=%d | obs=%s  act=%s",
+        cfg.env.id, plr_enabled, num_groups, envs_per_group, num_groups * envs_per_group,
+        env.observation_spec["observation"].shape,
+        env.action_spec.shape,
+    )
 
     num_eval_episodes = cfg.training.get("num_eval_episodes", 5)
-    eval_env = make_parallel_env(cfg, device, num_envs=num_eval_episodes, obs_rms=obs_rms, dtype=network_dtype)
+    if plr_enabled:
+        eval_env = make_ns_eval_env(cfg, device, obs_rms=obs_rms, dtype=network_dtype)
+        log.info(
+            "Eval: %d held-out NS configs (seed=%d), %d parallel eval envs",
+            cfg.env.plr.num_eval_configs, cfg.env.plr.eval_seed, num_eval_episodes,
+        )
+    else:
+        eval_env = make_parallel_env(cfg, device, num_envs=num_eval_episodes, obs_rms=obs_rms, dtype=network_dtype)
 
     # ── Build PPO modules ──────────────────────────────────────────────
     # Set RPO alpha before building models (distribution class reads it)

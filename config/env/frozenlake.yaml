@@ -7,3 +7,16 @@ frame_skip: 1
 # Set normalize_obs: false — normalizing integer states is meaningless.
 normalize_obs: false
 normalize_reward: false   # Rewards are binary (0 or 1); no scaling needed
+
+# ── Prioritized Level Replay (PLR) ───────────────────────────────────────
+# Set enabled: true to rotate NS configs during training via PLR.
+# Eval always uses a fixed held-out set (eval_seed) regardless of this flag.
+plr:
+  enabled: true
+  sampler_key: frozenlake    # key into NS_ENV_SAMPLERS
+  capacity: 50               # smaller buffer — FrozenLake param space is narrower
+  replay_prob: 0.5           # P(replay existing level) once buffer is warm
+  score_temp: 0.1            # softmax temperature (lower → greedier replay)
+  staleness_coef: 0.1        # weight for staleness in sampling distribution
+  num_eval_configs: 20       # distinct held-out configs for evaluation
+  eval_seed: 42              # separate seed so eval configs differ from training
