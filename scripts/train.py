@@ -678,14 +678,20 @@ def train(cfg: DictConfig) -> None:
             eval_reward_sum = ep_returns.mean().item()
             eval_steps = ep_lengths.float().mean().item()
 
+            # IQM: mean of returns in [25th, 75th] percentile — robust to outlier episodes
+            q1, q3 = torch.quantile(ep_returns, torch.tensor([0.25, 0.75], device=device))
+            iqm_mask = (ep_returns >= q1) & (ep_returns <= q3)
+            eval_reward_iqm = ep_returns[iqm_mask].mean().item() if iqm_mask.any() else eval_reward_sum
+
             metrics.update({
-                "eval/reward_sum": eval_reward_sum,
-                "eval/reward_mean": eval_reward_sum / max(eval_steps, 1),
+                "eval/reward_mean": eval_reward_sum,
+                "eval/reward_iqm": eval_reward_iqm,
+                "eval/reward_per_step": eval_reward_sum / max(eval_steps, 1),
                 "eval/step_count": eval_steps,
             })
             log.info(
-                "[iter %d | frames %d] eval_return=%.2f  eval_steps=%.1f",
-                collect_iter, global_step, eval_reward_sum, eval_steps,
+                "[iter %d | frames %d] eval_return=%.2f  eval_iqm=%.2f  eval_steps=%.1f",
+                collect_iter, global_step, eval_reward_sum, eval_reward_iqm, eval_steps,
             )
 
         if cfg.wandb.enabled:
@@ -694,7 +700,7 @@ def train(cfg: DictConfig) -> None:
         pbar.update(batch_frames)
         postfix = dict(reward=f"{mean_reward:.3f}")
         if collect_iter % cfg.training.eval_interval == 0:
-            postfix["eval_return"] = f"{eval_reward_sum:.2f}"
+            postfix["eval_return"] = f"{eval_reward_sum:.2f}  iqm={eval_reward_iqm:.2f}"
         pbar.set_postfix(postfix)
 
         # ── Checkpointing ─────────────────────────────────────────────

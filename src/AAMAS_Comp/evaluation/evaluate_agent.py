@@ -145,14 +145,20 @@ def run_complete_evaluation(env, agent, start_seed, num_episodes, name_prefix, s
         }
 
     # Aggregate across all episodes
-    all_rewards = [s["total_reward"] for s in summary.values()]
+    all_rewards = np.array([s["total_reward"] for s in summary.values()])
     all_steps = [s["num_steps"] for s in summary.values()]
     all_mean_dt = [s["mean_decision_time"] for s in summary.values()]
     all_tf_changes = [s["num_transition_fn_changes"] for s in summary.values()]
 
+    # IQM: mean of returns in [25th, 75th] percentile — robust to outlier episodes
+    q1, q3 = np.percentile(all_rewards, [25, 75])
+    iqm_rewards = all_rewards[(all_rewards >= q1) & (all_rewards <= q3)]
+    iqm_total_reward = float(np.mean(iqm_rewards)) if len(iqm_rewards) > 0 else float(np.mean(all_rewards))
+
     aggregate = {
         "mean_total_reward": float(np.mean(all_rewards)),
         "std_total_reward": float(np.std(all_rewards)),
+        "iqm_total_reward": iqm_total_reward,
         "mean_episode_steps": float(np.mean(all_steps)),
         "mean_decision_time": float(np.mean(all_mean_dt)),
         "std_decision_time": float(np.std(all_mean_dt)),
@@ -175,6 +181,7 @@ def run_complete_evaluation(env, agent, start_seed, num_episodes, name_prefix, s
     print(f"Seed Range:          {start_seed} - {start_seed + num_episodes - 1}")
     print(f"Total Time:          {total_time:.2f}s")
     print(f"Mean Total Reward:   {aggregate['mean_total_reward']:.4f} +/- {aggregate['std_total_reward']:.4f}")
+    print(f"IQM  Total Reward:   {aggregate['iqm_total_reward']:.4f}")
     print(f"Mean Episode Steps:  {aggregate['mean_episode_steps']:.1f}")
     print(f"Mean Decision Time:  {aggregate['mean_decision_time']:.6f}s +/- {aggregate['std_decision_time']:.6f}s")
     print(f"Mean Number of T(s,a) Changes: {aggregate['mean_transition_fn_changes']:.2f} +/- {aggregate['std_transition_fn_changes']:.2f}")

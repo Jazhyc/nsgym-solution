@@ -17,5 +17,5 @@ plr:
   replay_prob: 0.5            # P(replay existing level) once buffer is warm
   score_temp: 0.1             # softmax temperature (lower → greedier replay)
   staleness_coef: 0.1         # weight for staleness in sampling distribution
-  num_eval_configs: 20        # distinct held-out configs for evaluation
+  num_eval_configs: 50        # distinct held-out configs for evaluation
   eval_seed: 42               # separate seed so eval configs differ from training
