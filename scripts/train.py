@@ -22,6 +22,8 @@ import os
 import warnings
 from pathlib import Path
 
+import multiprocessing as mp
+
 import hydra
 import torch
 from omegaconf import DictConfig, OmegaConf
@@ -264,7 +266,7 @@ def make_parallel_env(cfg: DictConfig, device: torch.device, num_envs: int = 1, 
     return env
 
 
-def make_ns_plr_env(cfg: DictConfig, device: torch.device, obs_rms: RunningMeanStd | None = None, dtype: torch.dtype | None = None) -> TransformedEnv:
+def make_ns_plr_env(cfg: DictConfig, device: torch.device, obs_rms: RunningMeanStd | None = None, dtype: torch.dtype | None = None, stats_queue=None) -> TransformedEnv:
     """Create a PLREnv-backed TorchRL TransformedEnv for NS training.
 
     Each call produces an independent env with its own PLRBuffer — safe to
@@ -280,6 +282,7 @@ def make_ns_plr_env(cfg: DictConfig, device: torch.device, obs_rms: RunningMeanS
         score_temp=plr_cfg.score_temp,
         staleness_coef=plr_cfg.staleness_coef,
         seed=None,  # None → OS entropy, so each worker explores different configs
+        stats_queue=stats_queue,
     )
     base_env = GymWrapper(NoInfoWrapper(plr_env), device=device)
 
@@ -445,15 +448,22 @@ def train(cfg: DictConfig) -> None:
 
     if plr_enabled:
         from functools import partial
+        # Manager().Queue() uses a proxy object that works across process
+        # boundaries regardless of spawn/fork start method. Plain mp.Queue()
+        # can silently disconnect when pickled through ParallelEnv workers.
+        _plr_mp_manager = mp.Manager()
+        plr_stats_queue = _plr_mp_manager.Queue(maxsize=2000)
         collector_envs = [
             ParallelEnv(
                 num_workers=envs_per_group,
-                create_env_fn=partial(make_ns_plr_env, cfg, device, obs_rms, network_dtype),
+                create_env_fn=partial(make_ns_plr_env, cfg, device, obs_rms, network_dtype, plr_stats_queue),
                 serial_for_single=True,
             )
             for _ in range(num_groups)
         ]
     else:
+        _plr_mp_manager = None
+        plr_stats_queue = None
         collector_envs = [
             make_parallel_env(cfg, device, num_envs=envs_per_group, dtype=network_dtype, obs_rms=obs_rms)
             for _ in range(num_groups)
@@ -774,6 +784,21 @@ def train(cfg: DictConfig) -> None:
                 ep_returns.shape[0], n_shards,
             )
 
+        # ── PLR buffer stats (aggregated from all worker subprocesses) ───
+        if plr_stats_queue is not None:
+            plr_samples = []
+            while True:
+                try:
+                    plr_samples.append(plr_stats_queue.get_nowait())
+                except Exception:
+                    break
+            if plr_samples:
+                plr_keys = plr_samples[0].keys()
+                metrics.update({
+                    k: sum(s[k] for s in plr_samples) / len(plr_samples)
+                    for k in plr_keys
+                })
+
         if cfg.wandb.enabled:
             wandb.log(metrics, step=global_step)
 
@@ -805,6 +830,9 @@ def train(cfg: DictConfig) -> None:
     final_path = ckpt_dir / "ppo_final.pt"
     PPOAgent(actor=actor, device=device, obs_rms=obs_rms).save(str(final_path))
     log.info("Training complete. Final model → %s", final_path)
+
+    if _plr_mp_manager is not None:
+        _plr_mp_manager.shutdown()
 
     if cfg.wandb.enabled:
         wandb.finish()

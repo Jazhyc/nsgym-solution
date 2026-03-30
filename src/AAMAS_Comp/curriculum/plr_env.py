@@ -106,6 +106,7 @@ class PLREnv(gym.Env):
         score_temp: float = 0.1,
         staleness_coef: float = 0.1,
         seed: int | None = None,
+        stats_queue=None,
     ) -> None:
         super().__init__()
         sampler = NS_ENV_SAMPLERS[sampler_key](seed=seed)
@@ -120,6 +121,9 @@ class PLREnv(gym.Env):
         self._level_id: int | None = None
         self._episode_return: float = 0.0
         self._env: gym.Env | None = None
+        self._stats_queue = stats_queue
+        self._episode_count: int = 0
+        self._replay_count: int = 0
 
         # Build a throwaway env to read spaces, then discard it
         _, init_config = self.plr.sample()
@@ -135,6 +139,19 @@ class PLREnv(gym.Env):
 
         # Sample next config and rebuild env
         self._level_id, config = self.plr.sample()
+
+        # Track replay/explore ratio and push stats to main process
+        if self.plr.last_was_replay:
+            self._replay_count += 1
+        self._episode_count += 1
+        if self._stats_queue is not None:
+            stats = self.plr.stats()
+            stats["plr/replay_fraction"] = self._replay_count / self._episode_count
+            try:
+                self._stats_queue.put_nowait(stats)
+            except Exception:
+                pass  # queue full — drop silently
+
         if self._env is not None:
             self._env.close()
         self._env = _build_ns_env(config)

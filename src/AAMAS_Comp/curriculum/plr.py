@@ -141,9 +141,10 @@ class PLRBuffer:
         replay_prob:    Probability of replaying an existing level vs exploring
                         a new one (once `min_fill` fraction of capacity is
                         populated).  Default: 0.5.
-        score_temp:     Softmax temperature for score-based sampling.
-                        Lower → more greedy (e.g. 0.01).
-                        Higher → more uniform (e.g. 1.0).
+        score_temp:     Temperature for rank-based sampling: P ∝ (1/rank)^(1/temp).
+                        temp=1 → standard 1/rank (paper default).
+                        temp→0 → greedy (always rank 1).
+                        temp→∞ → uniform.
                         Default: 0.1.
         staleness_coef: Weight in [0, 1] for the staleness component of the
                         sampling distribution.  0 = pure score-based.
@@ -179,6 +180,7 @@ class PLRBuffer:
         self.rng = np.random.default_rng(seed)
 
         self._entries: list[_LevelEntry] = []
+        self.last_was_replay: bool = False  # set by sample(); True = replay, False = explore
 
     # ── Public API ────────────────────────────────────────────────────────────
 
@@ -278,6 +280,7 @@ class PLRBuffer:
         return self.rng.random() > self.replay_prob
 
     def _explore(self) -> tuple[int, NSEnvConfig]:
+        self.last_was_replay = False
         config = self.sampler.sample()
         if self.size >= self.capacity:
             # Evict the lowest-scoring entry
@@ -289,6 +292,7 @@ class PLRBuffer:
         return idx, config
 
     def _replay(self) -> tuple[int, NSEnvConfig]:
+        self.last_was_replay = True
         dist = self._compute_distribution()
         idx = int(self.rng.choice(len(self._entries), p=dist))
         return idx, self._entries[idx].config
@@ -301,9 +305,12 @@ class PLRBuffer:
         scores = np.array([e.score for e in self._entries])
         staleness = np.array([e.staleness for e in self._entries], dtype=float)
 
-        # Score distribution: temperature-scaled softmax (numerically stable)
-        s = scores - scores.max()
-        score_dist = np.exp(s / self.score_temp)
+        # Rank-based score distribution (Jiang et al. 2021).
+        # rank 1 = highest score. Weight = (1/rank)^(1/temp), then normalise.
+        # Scale-invariant: only ordering matters, not absolute score values.
+        ranks = np.empty(n, dtype=float)
+        ranks[np.argsort(scores)[::-1]] = np.arange(1, n + 1)
+        score_dist = (1.0 / ranks) ** (1.0 / self.score_temp)
         score_dist /= score_dist.sum()
 
         # Staleness distribution: proportional to staleness count
