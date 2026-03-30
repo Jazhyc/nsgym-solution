@@ -254,6 +254,7 @@ def train(cfg: DictConfig) -> None:
     next_eval_frame = 0  # eval on first iteration
 
     global_step = 0
+    best_eval_iqm = float("-inf")
 
     for collect_iter, tensordict_data in enumerate(collector):
         batch_frames = tensordict_data.numel()
@@ -391,6 +392,7 @@ def train(cfg: DictConfig) -> None:
             )
             eval_reward_mean = eval_results["eval/reward_mean"]
             eval_reward_iqm = eval_results["eval/reward_iqm"]
+            best_eval_iqm = max(best_eval_iqm, eval_reward_iqm)
             metrics.update({k: v for k, v in eval_results.items() if k not in ("n_shards", "n_configs")})
             log.info(
                 "[iter %d | frames %d] eval_return=%.2f  eval_iqm=%.2f  eval_steps=%.1f  (%d configs, %d shards)",
@@ -444,6 +446,17 @@ def train(cfg: DictConfig) -> None:
 
     if _plr_mp_manager is not None:
         _plr_mp_manager.shutdown()
+
+    # ── Hyperparameter search output ───────────────────────────────────────
+    # Written when train.py is launched by hparam_search.py via the
+    # `+hparam_output_path=<file>` Hydra override.
+    hparam_output_path = cfg.get("hparam_output_path", None)
+    if hparam_output_path:
+        import json as _json
+        Path(hparam_output_path).write_text(
+            _json.dumps({"eval/reward_iqm": best_eval_iqm})
+        )
+        log.info("Wrote hparam metric to %s (best eval/reward_iqm=%.4f)", hparam_output_path, best_eval_iqm)
 
     if cfg.wandb.enabled:
         wandb.finish()

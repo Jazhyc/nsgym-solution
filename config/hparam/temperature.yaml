@@ -1,0 +1,41 @@
+# Hyperparameter search config for PLR score_temp.
+#
+# Run with:
+#   python scripts/hparam_search.py config/hparam/temperature.yaml
+#
+# Each trial launches train.py with sampled overrides.  The training run
+# logs to `wandb.project` below; the search script creates one additional
+# summary run (results table) in the same project at the end.
+
+# Which env config to use (maps to config/env/<env>.yaml via train.py defaults)
+env: ant
+
+# Random search budget
+n_trials: 20
+seed: 0  # seed for the parameter sampler RNG (not the training seed)
+
+# Metric to optimise (must appear in hparam_output.json written by train.py)
+metric: eval/reward_iqm
+direction: maximize  # maximize | minimize
+
+# Overrides applied to every trial (use to shorten runs for search)
+fixed_overrides:
+  collector.total_frames: 1_000_000
+
+# WandB project for trial runs and the summary run
+wandb:
+  project: nsgym-hparam-ant
+  group: temperature_search
+
+# Parameters to search.
+# Supported distributions:
+#   uniform      — float sampled uniformly in [low, high]
+#   log_uniform  — float sampled log-uniformly in [low, high]
+#   int_uniform  — integer sampled uniformly in [low, high] (inclusive)
+#   categorical  — one value chosen from `choices`
+params:
+  - name: env.plr.score_temp
+    type: float
+    distribution: log_uniform
+    low: 0.05
+    high: 2.0
