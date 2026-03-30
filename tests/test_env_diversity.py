@@ -8,26 +8,106 @@ detailed breakdown of scheduler classes, update function classes, and
 parameter kwargs so you can visually inspect how diverse the sampled
 configs are.
 """
-import math
 from collections import Counter, defaultdict
 
 import numpy as np
 import pytest
 
-from AAMAS_Comp.curriculum.plr_env import sample_held_out_configs
+from AAMAS_Comp.curriculum.plr_env import FixedNSEnv, sample_held_out_configs
 
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
-def _summarise_configs(configs, label: str, n_bootstrap: int = 2000, seed: int = 0):
+def _random_policy_returns(
+    sampler_key: str,
+    n_configs: int,
+    max_steps: int = 1000,
+    seed: int = 0,
+) -> np.ndarray:
+    """Run one random-policy episode per NS config and return the episode returns.
+
+    Each config is wrapped in a FixedNSEnv so parameters evolve within the
+    episode exactly as they would during real evaluation (scheduler + update_fn
+    fire on every step), but reset to initial values on reset().
+
+    Args:
+        sampler_key:  Key into NS_ENV_SAMPLERS (e.g. "cartpole", "frozenlake").
+        n_configs:    Number of distinct configs to sample and roll out.
+        max_steps:    Hard cap per episode.  The env's own TimeLimit wrapper
+                      will truncate earlier for most envs (CartPole→500,
+                      FrozenLake→200, Ant→1000).
+        seed:         Seed for both config sampling and action sampling.
+
+    Returns:
+        np.ndarray of shape (n_configs,) with total episode returns.
+    """
+    configs = sample_held_out_configs(sampler_key, n_configs, seed=seed)
+    rng = np.random.default_rng(seed)
+    returns = []
+
+    for cfg in configs:
+        env = FixedNSEnv(cfg)
+        # Use a fresh integer seed per episode so episodes are independent
+        ep_seed = int(rng.integers(0, 2**31))
+        env.reset(seed=ep_seed)
+        ep_return = 0.0
+        for _ in range(max_steps):
+            action = env.action_space.sample()
+            _, reward, terminated, truncated, _ = env.step(action)
+            ep_return += float(reward)
+            if terminated or truncated:
+                break
+        returns.append(ep_return)
+        env.close()
+
+    return np.array(returns)
+
+
+def _summarise_configs(
+    configs,
+    label: str,
+    sampler_key: str,
+    n_ground_truth: int = 300,
+    max_steps: int = 1000,
+    n_bootstrap: int = 2000,
+    seed: int = 0,
+):
     """Print a diversity report for a list of NSEnvConfigs.
+
+    This function does two independent things:
+
+    Part 1 — Config diversity report (uses the actual `configs` list):
+        Counts how often each scheduler class, update function class, and
+        (param, scheduler, update_fn) combination appears across all sampled
+        configs. Also prints numerical kwarg ranges (e.g. amplitude, period).
+        This verifies that `sample_held_out_configs` is actually exploring the
+        parameter space rather than collapsing to a few repeated configs.
+
+    Part 2 — Bootstrap IQM variance from random-policy rollouts:
+        Answers: "How many held-out configs do I need for a reliable IQM?"
+        Uses actual episode returns from a random policy rather than any
+        distributional assumption (no N(0,1), no parameter proxy).
+
+        Method:
+          1. Sample `n_ground_truth` configs and run one random-policy episode
+             each.  This large sample approximates the true marginal return
+             distribution across configs.
+          2. Bootstrap: for each candidate eval set size, resample `size`
+             returns from the ground-truth pool and compute IQM.  Repeat
+             `n_bootstrap` times.  Report the 95% CI half-width.
+
+        The CI widths are in *real return units* for this specific env+sampler.
+        A random policy gives a lower bound on config-induced return variance —
+        a trained policy that is sensitive to the NS params will show at least
+        as much variance (often more).
 
     Returns a dict with coverage stats so callers can assert if desired.
     """
     rng = np.random.default_rng(seed)
 
+    # ── Part 1: Config diversity ────────────────────────────────────────────
     scheduler_counts: Counter = Counter()
     update_fn_counts: Counter = Counter()
     param_counts: Counter = Counter()
@@ -87,30 +167,58 @@ def _summarise_configs(configs, label: str, n_bootstrap: int = 2000, seed: int =
                 f"  [{arr.min():.4g}, {arr.max():.4g}]"
             )
 
-    # ── Bootstrap IQM spread estimate ──────────────────────────────────────
-    # Simulate what 'n' held-out configs would give as IQM variance.
-    # We treat each config as contributing one hypothetical return drawn from
-    # N(0,1) — purely to show the statistical point about sample size, not
-    # the actual env difficulty.
-    print(f"\n{'Bootstrap IQM variance analysis':}")
+    # ── Part 2: Bootstrap IQM variance from random-policy rollouts ──────────
+    # Sample n_ground_truth configs, run one random episode each.
+    # Using a seed offset so ground-truth configs don't overlap the eval set.
+    print(f"\nCollecting random-policy returns ({n_ground_truth} configs) …")
+    ground_truth = _random_policy_returns(
+        sampler_key,
+        n_configs=n_ground_truth,
+        max_steps=max_steps,
+        seed=seed + 1000,
+    )
+
+    gt_mean = ground_truth.mean()
+    gt_std  = ground_truth.std()
+    gt_min  = ground_truth.min()
+    gt_max  = ground_truth.max()
+    q1_gt, q3_gt = np.percentile(ground_truth, [25, 75])
+    iqm_mask_gt = (ground_truth >= q1_gt) & (ground_truth <= q3_gt)
+    gt_iqm = ground_truth[iqm_mask_gt].mean() if iqm_mask_gt.any() else gt_mean
+    gt_skew = float(np.mean(((ground_truth - gt_mean) / gt_std) ** 3)) if gt_std > 1e-8 else 0.0
+
+    print(f"\nRandom-policy return distribution  (n={n_ground_truth}, seed={seed+1000})")
     print("-" * 65)
+    print(f"  mean={gt_mean:.3f}  std={gt_std:.3f}  skew={gt_skew:+.2f}")
+    print(f"  min={gt_min:.3f}   max={gt_max:.3f}")
+    print(f"  IQM={gt_iqm:.3f}   [Q1={q1_gt:.3f}, Q3={q3_gt:.3f}]")
+    print()
+    print("  A non-zero std confirms that different NS configs produce different")
+    print("  episode returns even under a random policy, so config diversity")
+    print("  meaningfully affects difficulty.  High skew means a few configs are")
+    print("  much easier/harder than the rest (IQM is more robust than mean here).")
+
+    # Bootstrap: resample `size` values from ground_truth with replacement,
+    # compute IQM, repeat n_bootstrap times.  CI widths are in return units.
+    print(f"\nBootstrap IQM variance  (resampled from ground-truth pool, n_bootstrap={n_bootstrap})")
+    print("-" * 65)
+    print(f"  {'n':>5}  {'IQM std':>10}  {'95% CI ±':>12}  {'CI / σ':>8}")
+    print(f"  {'-'*5}  {'-'*10}  {'-'*12}  {'-'*8}")
     for size in [10, 20, 50, 100]:
         iqms = []
         for _ in range(n_bootstrap):
-            sample = rng.standard_normal(size)
+            sample = rng.choice(ground_truth, size=size, replace=True)
             q1, q3 = np.percentile(sample, [25, 75])
             trimmed = sample[(sample >= q1) & (sample <= q3)]
             iqms.append(trimmed.mean() if len(trimmed) > 0 else sample.mean())
-        iqms = np.array(iqms)
-        sem = iqms.std()
-        ci_width = 1.96 * sem
-        print(
-            f"  n={size:<4}  IQM std={sem:.4f}  95% CI width ≈ ±{ci_width:.4f}"
-            f"  (relative to σ=1 returns)"
-        )
+        arr = np.array(iqms)
+        sem = arr.std()
+        ci = 1.96 * sem
+        ci_rel = ci / gt_std if gt_std > 1e-8 else float("nan")
+        print(f"  {size:>5}  {sem:>10.4f}  {ci:>12.4f}  {ci_rel:>7.1%}")
     print()
-    print("  Rule of thumb: you want the CI width to be < 5–10% of the")
-    print("  return range to reliably detect PLR vs baseline differences.")
+    print("  CI / σ: fraction of the return std covered by the 95% CI half-width.")
+    print("  < 20% → n is sufficient to detect moderate PLR vs baseline effects.")
 
     print(f"\n{sep}\n")
 
@@ -126,16 +234,30 @@ def _summarise_configs(configs, label: str, n_bootstrap: int = 2000, seed: int =
 # Tests
 # ---------------------------------------------------------------------------
 
+NUM_CONFIGS = 64
+
+
 @pytest.mark.parametrize("sampler_key,n_configs,seed", [
-    ("frozenlake", 20, 42),
-    ("cartpole",   20, 42),
+    ("frozenlake", NUM_CONFIGS, 42),
+    ("cartpole",   NUM_CONFIGS, 42),
 ])
 def test_print_env_diversity(sampler_key, n_configs, seed):
-    """Sample held-out configs and print their spread. Always passes."""
+    """Sample held-out configs and print their spread. Always passes.
+
+    Part 1 (_summarise_configs diversity report) uses `n_configs` real configs.
+    Part 2 (bootstrap IQM) samples an additional `n_ground_truth` configs,
+    runs one random-policy episode each, and reports CI widths in real return
+    units — no distributional assumptions.
+    """
     configs = sample_held_out_configs(sampler_key, n_configs, seed=seed)
     assert len(configs) == n_configs
 
-    stats = _summarise_configs(configs, label=f"{sampler_key} n={n_configs} seed={seed}")
+    stats = _summarise_configs(
+        configs,
+        label=f"{sampler_key} n={n_configs} seed={seed}",
+        sampler_key=sampler_key,
+        n_ground_truth=300,
+    )
 
     # Basic sanity: at least some diversity (not all configs identical)
     assert stats["n_unique_combos"] >= 1
@@ -144,13 +266,22 @@ def test_print_env_diversity(sampler_key, n_configs, seed):
 
 @pytest.mark.slow
 @pytest.mark.parametrize("sampler_key,n_configs,seed", [
-    ("ant", 20, 42),
+    ("ant", NUM_CONFIGS, 42),
 ])
 def test_print_env_diversity_ant(sampler_key, n_configs, seed):
-    """Same report for Ant (marked slow due to MuJoCo imports)."""
+    """Same report for Ant (marked slow due to MuJoCo imports and rollouts).
+
+    Uses a smaller n_ground_truth (100) to keep runtime reasonable — each
+    Ant episode can be up to 1000 MuJoCo steps.
+    """
     configs = sample_held_out_configs(sampler_key, n_configs, seed=seed)
     assert len(configs) == n_configs
-    stats = _summarise_configs(configs, label=f"{sampler_key} n={n_configs} seed={seed}")
+    stats = _summarise_configs(
+        configs,
+        label=f"{sampler_key} n={n_configs} seed={seed}",
+        sampler_key=sampler_key,
+        n_ground_truth=100,
+    )
     assert stats["n_unique_combos"] >= 1
 
 

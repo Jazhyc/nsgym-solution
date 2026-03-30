@@ -326,17 +326,30 @@ def make_fixed_ns_eval_env(config, cfg: DictConfig, device: torch.device, obs_rm
     return TransformedEnv(base_env, Compose(*transforms))
 
 
-def make_ns_eval_env(cfg: DictConfig, device: torch.device, obs_rms: RunningMeanStd | None = None, dtype: torch.dtype | None = None) -> TransformedEnv | ParallelEnv:
-    """Build the held-out eval env for PLR runs.
+def make_ns_eval_shards(
+    cfg: DictConfig,
+    device: torch.device,
+    obs_rms: RunningMeanStd | None = None,
+    dtype: torch.dtype | None = None,
+) -> list[list]:
+    """Prepare lazy eval shards for PLR runs — NO subprocesses spawned here.
 
     Samples `plr.num_eval_configs` NS configs once using `plr.eval_seed`,
-    then creates `num_eval_episodes` parallel envs cycling through those configs.
-    The configs never change — this gives a stable eval signal.
+    then groups them into shards of at most `num_eval_episodes` configs each.
+    Each shard is a list of factory callables (partial → TransformedEnv).
+
+    During eval the caller builds a ParallelEnv from one shard at a time,
+    runs the rollout, then closes it before moving to the next shard. This
+    keeps at most `num_eval_episodes` subprocesses alive at once regardless
+    of how large `num_eval_configs` is.
+
+    Returns:
+        List of lists, where each inner list contains factory callables.
     """
     from functools import partial
 
     plr_cfg = cfg.env.plr
-    num_eval = cfg.training.num_eval_episodes
+    batch_size = cfg.training.num_eval_episodes
 
     held_out = sample_held_out_configs(
         sampler_key=plr_cfg.sampler_key,
@@ -344,18 +357,15 @@ def make_ns_eval_env(cfg: DictConfig, device: torch.device, obs_rms: RunningMean
         seed=plr_cfg.eval_seed,
     )
 
-    factories = [
-        partial(make_fixed_ns_eval_env, held_out[i % len(held_out)], cfg, device, obs_rms, dtype)
-        for i in range(num_eval)
-    ]
-
-    if num_eval == 1:
-        return factories[0]()
-    return ParallelEnv(
-        num_workers=num_eval,
-        create_env_fn=factories,
-        serial_for_single=True,
-    )
+    shards: list[list] = []
+    for start in range(0, len(held_out), batch_size):
+        shard_configs = held_out[start : start + batch_size]
+        factories = [
+            partial(make_fixed_ns_eval_env, c, cfg, device, obs_rms, dtype)
+            for c in shard_configs
+        ]
+        shards.append(factories)
+    return shards
 
 
 # ---------------------------------------------------------------------------
@@ -460,13 +470,18 @@ def train(cfg: DictConfig) -> None:
 
     num_eval_episodes = cfg.training.get("num_eval_episodes", 5)
     if plr_enabled:
-        eval_env = make_ns_eval_env(cfg, device, obs_rms=obs_rms, dtype=network_dtype)
+        n_configs = cfg.env.plr.num_eval_configs
+        # Lazy shards: just factory callables, no subprocesses spawned yet.
+        # Each shard is built/torn down during eval to bound memory + processes.
+        eval_shard_factories = make_ns_eval_shards(cfg, device, obs_rms=obs_rms, dtype=network_dtype)
         log.info(
-            "Eval: %d held-out NS configs (seed=%d), %d parallel eval envs",
-            cfg.env.plr.num_eval_configs, cfg.env.plr.eval_seed, num_eval_episodes,
+            "Eval: %d held-out NS configs (seed=%d), %d parallel eval envs, %d shard(s)",
+            n_configs, cfg.env.plr.eval_seed, num_eval_episodes, len(eval_shard_factories),
         )
     else:
-        eval_env = make_parallel_env(cfg, device, num_envs=num_eval_episodes, obs_rms=obs_rms, dtype=network_dtype)
+        # Non-PLR: single persistent eval env (small, no sharding needed)
+        eval_env_persistent = make_parallel_env(cfg, device, num_envs=num_eval_episodes, obs_rms=obs_rms, dtype=network_dtype)
+        eval_shard_factories = None
 
     # ── Build PPO modules ──────────────────────────────────────────────
     # Set RPO alpha before building models (distribution class reads it)
@@ -524,11 +539,18 @@ def train(cfg: DictConfig) -> None:
     total_frames = cfg.collector.total_frames
     pbar = tqdm(total=total_frames, desc="Training")
 
+    # Eval scheduling: trigger eval at evenly-spaced frame thresholds.
+    # eval_ratio=0.1 → eval at 0%, 10%, 20%, …, 100% of total_frames.
+    eval_ratio = cfg.training.get("eval_ratio", 0.1)
+    eval_every_frames = max(1, int(total_frames * eval_ratio))
+    next_eval_frame = 0  # eval on first iteration
+
     global_step = 0
 
     for collect_iter, tensordict_data in enumerate(collector):
         batch_frames = tensordict_data.numel()
         global_step += batch_frames
+        did_eval_this_iter = False
 
         # Drop actor intermediate outputs — ClipPPOLoss recomputes them from
         # "observation"; keeping them just wastes memory and TensorDict ops.
@@ -649,49 +671,107 @@ def train(cfg: DictConfig) -> None:
         }
 
         # ── Evaluation ────────────────────────────────────────────────
-        if collect_iter % cfg.training.eval_interval == 0:
-            # Run all eval episodes in parallel: N envs step simultaneously,
-            # done_mask stops reward accumulation once each env finishes so
-            # auto-reset doesn't corrupt episode returns.
-            ep_returns = torch.zeros(num_eval_episodes, device=device)
-            ep_lengths = torch.zeros(num_eval_episodes, dtype=torch.long, device=device)
-            finished = torch.zeros(num_eval_episodes, dtype=torch.bool, device=device)
+        if global_step >= next_eval_frame:
+            did_eval_this_iter = True
+            next_eval_frame += eval_every_frames
+            all_returns: list[torch.Tensor] = []
+            all_lengths: list[torch.Tensor] = []
 
-            with set_exploration_type(ExplorationType.DETERMINISTIC), torch.no_grad():
-                td = eval_env.reset()
-                for _ in range(cfg.training.eval_rollout_steps):
-                    td = actor(td)
-                    td = eval_env.step(td)
+            if eval_shard_factories is not None:
+                # PLR path: build each shard on demand, tear down after use.
+                # At most `num_eval_episodes` subprocesses alive at once.
+                n_shards = len(eval_shard_factories)
+                eval_pbar = tqdm(
+                    eval_shard_factories, desc="Eval", leave=False,
+                    total=n_shards, unit="shard",
+                )
+                with set_exploration_type(ExplorationType.DETERMINISTIC), torch.no_grad():
+                    for shard_idx, factories in enumerate(eval_pbar):
+                        n_envs = len(factories)
+                        if n_envs == 1:
+                            eval_env = factories[0]()
+                        else:
+                            eval_env = ParallelEnv(
+                                num_workers=n_envs,
+                                create_env_fn=factories,
+                                serial_for_single=True,
+                            )
 
-                    reward = td["next", "reward"].squeeze(-1)
-                    done = (td["next", "terminated"] | td["next", "truncated"]).squeeze(-1)
+                        shard_returns = torch.zeros(n_envs, device=device)
+                        shard_lengths = torch.zeros(n_envs, dtype=torch.long, device=device)
+                        shard_finished = torch.zeros(n_envs, dtype=torch.bool, device=device)
 
-                    ep_returns += reward * ~finished
-                    ep_lengths += (~finished).long()
-                    finished = finished | done
+                        td = eval_env.reset()
+                        for _ in range(cfg.training.eval_rollout_steps):
+                            td = actor(td)
+                            td = eval_env.step(td)
 
-                    if finished.all():
-                        break
+                            reward = td["next", "reward"].squeeze(-1)
+                            done = (td["next", "terminated"] | td["next", "truncated"]).squeeze(-1)
 
-                    td = step_mdp(td)
+                            shard_returns += reward * ~shard_finished
+                            shard_lengths += (~shard_finished).long()
+                            shard_finished = shard_finished | done
 
-            eval_reward_sum = ep_returns.mean().item()
+                            if shard_finished.all():
+                                break
+
+                            td = step_mdp(td)
+
+                        all_returns.append(shard_returns)
+                        all_lengths.append(shard_lengths)
+                        eval_env.close()  # tear down this shard's subprocesses
+                eval_pbar.close()
+            else:
+                # Non-PLR path: single persistent eval env
+                with set_exploration_type(ExplorationType.DETERMINISTIC), torch.no_grad():
+                    n_envs = num_eval_episodes
+                    shard_returns = torch.zeros(n_envs, device=device)
+                    shard_lengths = torch.zeros(n_envs, dtype=torch.long, device=device)
+                    shard_finished = torch.zeros(n_envs, dtype=torch.bool, device=device)
+
+                    td = eval_env_persistent.reset()
+                    for _ in range(cfg.training.eval_rollout_steps):
+                        td = actor(td)
+                        td = eval_env_persistent.step(td)
+
+                        reward = td["next", "reward"].squeeze(-1)
+                        done = (td["next", "terminated"] | td["next", "truncated"]).squeeze(-1)
+
+                        shard_returns += reward * ~shard_finished
+                        shard_lengths += (~shard_finished).long()
+                        shard_finished = shard_finished | done
+
+                        if shard_finished.all():
+                            break
+
+                        td = step_mdp(td)
+
+                    all_returns.append(shard_returns)
+                    all_lengths.append(shard_lengths)
+                n_shards = 1
+
+            ep_returns = torch.cat(all_returns)
+            ep_lengths = torch.cat(all_lengths)
+
+            eval_reward_mean = ep_returns.mean().item()
             eval_steps = ep_lengths.float().mean().item()
 
             # IQM: mean of returns in [25th, 75th] percentile — robust to outlier episodes
             q1, q3 = torch.quantile(ep_returns, torch.tensor([0.25, 0.75], device=device))
             iqm_mask = (ep_returns >= q1) & (ep_returns <= q3)
-            eval_reward_iqm = ep_returns[iqm_mask].mean().item() if iqm_mask.any() else eval_reward_sum
+            eval_reward_iqm = ep_returns[iqm_mask].mean().item() if iqm_mask.any() else eval_reward_mean
 
             metrics.update({
-                "eval/reward_mean": eval_reward_sum,
+                "eval/reward_mean": eval_reward_mean,
                 "eval/reward_iqm": eval_reward_iqm,
-                "eval/reward_per_step": eval_reward_sum / max(eval_steps, 1),
+                "eval/reward_per_step": eval_reward_mean / max(eval_steps, 1),
                 "eval/step_count": eval_steps,
             })
             log.info(
-                "[iter %d | frames %d] eval_return=%.2f  eval_iqm=%.2f  eval_steps=%.1f",
-                collect_iter, global_step, eval_reward_sum, eval_reward_iqm, eval_steps,
+                "[iter %d | frames %d] eval_return=%.2f  eval_iqm=%.2f  eval_steps=%.1f  (%d configs, %d shards)",
+                collect_iter, global_step, eval_reward_mean, eval_reward_iqm, eval_steps,
+                ep_returns.shape[0], n_shards,
             )
 
         if cfg.wandb.enabled:
@@ -699,8 +779,8 @@ def train(cfg: DictConfig) -> None:
 
         pbar.update(batch_frames)
         postfix = dict(reward=f"{mean_reward:.3f}")
-        if collect_iter % cfg.training.eval_interval == 0:
-            postfix["eval_return"] = f"{eval_reward_sum:.2f}  iqm={eval_reward_iqm:.2f}"
+        if did_eval_this_iter:
+            postfix["eval_return"] = f"{eval_reward_mean:.2f}  iqm={eval_reward_iqm:.2f}"
         pbar.set_postfix(postfix)
 
         # ── Checkpointing ─────────────────────────────────────────────
@@ -718,7 +798,8 @@ def train(cfg: DictConfig) -> None:
             e.close()
         except RuntimeError:
             pass  # Already closed by collector shutdown
-    eval_env.close()
+    if eval_shard_factories is None and eval_env_persistent is not None:
+        eval_env_persistent.close()
 
     # ── Final save ─────────────────────────────────────────────────────
     final_path = ckpt_dir / "ppo_final.pt"

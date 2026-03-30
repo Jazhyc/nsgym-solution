@@ -28,9 +28,9 @@ training:
   sub_batch_size: 64
   max_grad_norm: 0.5
   target_kl: 0.02
-  eval_interval: 20          # evaluate often; runs are short
+  eval_ratio: 0.2            # evaluate every X% of total training frames (0.2 = every 20%)
   eval_rollout_steps: 500
-  num_eval_episodes: 8
+  num_eval_episodes: 12        # max parallel eval envs per shard
   save_interval: 10000
   checkpoint_dir: checkpoints/cartpole
 

@@ -28,9 +28,9 @@ training:
   sub_batch_size: 64
   max_grad_norm: 0.5
   target_kl: 0.02
-  eval_interval: 20          # evaluate often; runs are short
+  eval_ratio: 0.2            # evaluate every X% of total training frames (0.1 = every 10%)
   eval_rollout_steps: 200
-  num_eval_episodes: 20      # FrozenLake is high-variance; use more eval episodes
+  num_eval_episodes: 12      # FrozenLake is high-variance; use more parallel eval envs
   save_interval: 200
   checkpoint_dir: checkpoints/frozenlake
 
