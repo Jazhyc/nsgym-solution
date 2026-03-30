@@ -23,11 +23,21 @@ import warnings
 from pathlib import Path
 
 import multiprocessing as mp
+from functools import partial
 
 import hydra
 import torch
+import torch._dynamo
 from omegaconf import DictConfig, OmegaConf
 from tqdm import tqdm
+
+# EnvBase.__del__ calls set_num_threads() to restore subprocess state.  If
+# this fires while dynamo is recompiling (e.g. async collector background
+# thread), the guard-check assertion fails inside __del__ and Python prints
+# "Exception ignored in: EnvBase.__del__".  Training is unaffected (it falls
+# back to eager), but the noise is confusing.  suppress_errors makes dynamo
+# fall back silently instead of propagating the AssertionError.
+torch._dynamo.config.suppress_errors = True
 
 import wandb
 
@@ -36,68 +46,18 @@ from AAMAS_Comp.optimizers.cbp import ContinualBackpropagation
 # Suppress FutureWarnings from torchrl (Python 3.13 compatibility issues)
 warnings.filterwarnings("ignore", category=FutureWarning, module="torchrl.modules.mcts.scores")
 
-# TorchRL imports
 from torchrl.collectors import MultiAsyncCollector
-from torchrl.data import OneHot, UnboundedContinuous
-from torchrl.envs import (
-    Compose,
-    DoubleToFloat,
-    ObservationNorm,
-    ParallelEnv,
-    StepCounter,
-    TransformedEnv,
-)
-from torchrl.envs.transforms import Transform
-import gymnasium as gym
-from gymnasium import Wrapper as GymnasiumWrapper
+from torchrl.envs import ParallelEnv
 
-from torchrl.envs.libs.gym import GymEnv, GymWrapper
-
-
-class DiscreteObsToFloat(Transform):
-    """Cast a one-hot discrete observation from int64 to float32.
-
-    TorchRL's GymWrapper already converts gym.spaces.Discrete observations to
-    one-hot integer tensors of shape (n,).  This transform casts them to
-    float32 so they can be fed directly into an MLP.
-    """
-
-    def __init__(self):
-        super().__init__(in_keys=["observation"], out_keys=["observation"])
-
-    def _apply_transform(self, obs: torch.Tensor) -> torch.Tensor:
-        return obs.float()
-
-    def _reset(self, tensordict, tensordict_reset):
-        # Base Transform._reset does NOT call _apply_transform; call it explicitly.
-        return self._call(tensordict_reset)
-
-    def transform_observation_spec(self, observation_spec):
-        spec = observation_spec["observation"]
-        observation_spec["observation"] = UnboundedContinuous(
-            shape=spec.shape,
-            dtype=torch.float32,
-        )
-        return observation_spec
-
-
-class NoInfoWrapper(GymnasiumWrapper):
-    """Drop the info dict from step/reset — prevents unused keys (Ant reward
-    components, position/velocity diagnostics) from being serialized over IPC
-    on every environment step."""
-
-    def step(self, action):
-        obs, reward, terminated, truncated, _info = self.env.step(action)
-        return obs, reward, terminated, truncated, {}
-
-    def reset(self, **kwargs):
-        obs, _info = self.env.reset(**kwargs)
-        return obs, {}
-from torchrl.envs.utils import ExplorationType, set_exploration_type, step_mdp
-
-# Project imports
 from AAMAS_Comp.agents.ppo import PPOAgent, make_ppo_models, RPOTanhNormal
-from AAMAS_Comp.curriculum import PLREnv, FixedNSEnv, sample_held_out_configs
+from AAMAS_Comp.envs.wrappers import RunningMeanStd, RewardNormalizer
+from AAMAS_Comp.envs.torchrl_factory import (
+    initialize_obs_norm,
+    make_single_env,
+    make_ns_plr_env,
+    make_ns_eval_shards,
+)
+from AAMAS_Comp.evaluation.utils import run_eval_shards
 
 log = logging.getLogger(__name__)
 
@@ -106,292 +66,21 @@ load_dotenv()
 
 
 # ---------------------------------------------------------------------------
-# Running observation normalization
+# Main training function
 # ---------------------------------------------------------------------------
 
-class RunningMeanStd:
-    """Welford online running mean / variance tracker.
-
-    Tracks the sufficient statistics (mean, var, count) so that
-    ``ObservationNorm`` transforms can be kept up-to-date as training
-    progresses.
-    """
-
-    def __init__(self, shape: tuple[int, ...] = (), device: torch.device | None = None):
-        # Use float64 for better numerical stability in running statistics
-        self.mean = torch.zeros(shape, device=device, dtype=torch.float64)
-        self.var = torch.ones(shape, device=device, dtype=torch.float64)
-        self.count: float = 0  # actual number of samples seen
-
-    def update(self, batch: torch.Tensor) -> None:
-        """Update stats with a new batch of observations ``(N, *shape)``."""
-        batch = batch.reshape(-1, *self.mean.shape)
-        # Compute batch stats in float64 for numerical stability
-        batch_f64 = batch.double()
-        batch_mean = batch_f64.mean(dim=0)
-        batch_var = batch_f64.var(dim=0, correction=0)
-        batch_count = batch.shape[0]
-        self._update_from_moments(batch_mean, batch_var, batch_count)
-
-    def _update_from_moments(self, batch_mean: torch.Tensor, batch_var: torch.Tensor, batch_count: int) -> None:
-        delta = batch_mean - self.mean
-        total_count = self.count + batch_count
-        new_mean = self.mean + delta * batch_count / total_count
-        m_a = self.var * self.count
-        m_b = batch_var * batch_count
-        m2 = m_a + m_b + delta.pow(2) * self.count * batch_count / total_count
-        self.mean = new_mean
-        self.var = m2 / total_count
-        self.count = total_count
-
-    @property
-    def std(self) -> torch.Tensor:
-        # Clamp variance before sqrt for stability, use higher minimum for safety
-        return torch.sqrt(self.var.clamp(min=1e-8)).clamp(min=1e-4)
-
-    def state_dict(self) -> dict:
-        return {"mean": self.mean.clone(), "var": self.var.clone(), "count": self.count}
-
-    def load_state_dict(self, d: dict) -> None:
-        self.mean = d["mean"]
-        self.var = d["var"]
-        self.count = d["count"]
-
-
-class RewardNormalizer:
-    """VecNormalize-style reward scaling.
-    
-    Tracks running variance of rewards and divides by sqrt(var) to bring
-    reward magnitudes to ~O(1).  Does NOT subtract the mean.
-    
-    Uses epsilon-initialized count (like SB3) so the initial std = 1.0
-    (identity scaling) and statistics build up gradually.
-    """
-    def __init__(self, device: torch.device | None = None):
-        self.reward_rms = RunningMeanStd(shape=(), device=device)
-        # Initialize with epsilon count so initial std = sqrt(1.0) = 1.0
-        self.reward_rms.count = 1e-4
-    
-    def normalize_batch(self, tensordict_data) -> None:
-        """Update stats and normalize rewards in a collected batch in-place."""
-        rewards = tensordict_data["next", "reward"]
-        # Update running stats with raw rewards (vectorized, no Python loop)
-        self.reward_rms.update(rewards)
-        # Scale rewards by 1/std (no mean subtraction)
-        std = self.reward_rms.std.to(rewards.dtype)
-        tensordict_data["next", "reward"].copy_(rewards / std)
-
-
-def initialize_obs_norm(cfg: DictConfig, device: torch.device, 
-                        dtype: torch.dtype | None = None) -> RunningMeanStd | None:
-    """Bootstrap observation normalization statistics from initial random rollout.
-    
-    Returns:
-        RunningMeanStd with bootstrap stats, or None if not enabled.
-    """
-    if not cfg.env.normalize_obs:
-        return None
-    
-    log.info("Bootstrapping observation normalization stats...")
-    # Use a plain env (no normalization) to collect raw observations
-    base_env = GymWrapper(NoInfoWrapper(gym.make(cfg.env.id)), device=device)
-    tmp = TransformedEnv(base_env, Compose(DoubleToFloat(), StepCounter()))
-    tmp.reset()
-    td = tmp.rollout(max_steps=cfg.env.normalize_obs_init_steps, break_when_any_done=False)
-    all_obs = td["observation"]
-    
-    obs_dim = tmp.observation_spec["observation"].shape[-1]
-    obs_rms = RunningMeanStd(shape=(obs_dim,), device=device)
-    obs_rms.count = 1e-4  # SB3-style epsilon init so initial std=1
-    obs_rms.update(all_obs)
-    tmp.close()
-    
-    log.info("Observation normalization bootstrapped (mean=%.3f, std=%.3f)",
-             obs_rms.mean.mean().item(), obs_rms.std.mean().item())
-    
-    return obs_rms
-
-
-# ---------------------------------------------------------------------------
-# Environment factory
-# ---------------------------------------------------------------------------
-
-def make_single_env(cfg: DictConfig, device: torch.device, obs_rms: RunningMeanStd | None = None, dtype: torch.dtype | None = None) -> TransformedEnv:
-    """Create a single TorchRL ``TransformedEnv`` instance.
-
-    Args:
-        cfg: Hydra config.
-        device: Device for the environment.
-        obs_rms: Optional RunningMeanStd with frozen stats for ObservationNorm.
-        dtype: Optional dtype to cast observations to.
-    """
-    # NoInfoWrapper drops Ant's reward components + position/velocity diagnostics
-    # from the TensorDict — they're serialized over IPC every step but never used.
-    base_env = GymWrapper(NoInfoWrapper(gym.make(cfg.env.id)), device=device)
-
-    transforms = []
-    obs_spec = base_env.observation_spec["observation"]
-    # TorchRL wraps gym.spaces.Discrete as OneHot(n) with int64 dtype.
-    # Cast to float32 so the MLP can consume it directly.
-    is_discrete_obs = isinstance(obs_spec, OneHot)
-
-    if is_discrete_obs:
-        transforms.append(DiscreteObsToFloat())
-    elif obs_rms is not None:
-        obs_norm = ObservationNorm(in_keys=["observation"], standard_normal=True)
-        # Materialise lazy buffers with frozen stats from bootstrap
-        obs_norm.loc = torch.nn.Parameter(obs_rms.mean.float().clone(), requires_grad=False)
-        obs_norm.scale = torch.nn.Parameter(obs_rms.std.float().clone(), requires_grad=False)
-        transforms.append(obs_norm)
-    transforms.append(DoubleToFloat())
-    transforms.append(StepCounter())
-
-    env = TransformedEnv(base_env, Compose(*transforms))
-    return env
-
-
-def make_parallel_env(cfg: DictConfig, device: torch.device, num_envs: int = 1, dtype: torch.dtype | None = None, obs_rms: RunningMeanStd | None = None) -> TransformedEnv | ParallelEnv:
-    """Create vectorized parallel environments."""
-    from functools import partial
-
-    if num_envs == 1:
-        env = make_single_env(cfg, device, obs_rms=obs_rms, dtype=dtype)
-    else:
-        env = ParallelEnv(
-            num_workers=num_envs,
-            create_env_fn=partial(make_single_env, cfg, device, obs_rms, dtype),
-            serial_for_single=True,
-        )
-
-    return env
-
-
-def make_ns_plr_env(cfg: DictConfig, device: torch.device, obs_rms: RunningMeanStd | None = None, dtype: torch.dtype | None = None, stats_queue=None) -> TransformedEnv:
-    """Create a PLREnv-backed TorchRL TransformedEnv for NS training.
-
-    Each call produces an independent env with its own PLRBuffer — safe to
-    run in separate ParallelEnv subprocesses.  Episode return is used as the
-    PLR score proxy (TD-error scoring would need critic values from the
-    training loop, which are not available inside the env).
-    """
-    plr_cfg = cfg.env.plr
-    plr_env = PLREnv(
-        sampler_key=plr_cfg.sampler_key,
-        plr_capacity=plr_cfg.capacity,
-        replay_prob=plr_cfg.replay_prob,
-        score_temp=plr_cfg.score_temp,
-        staleness_coef=plr_cfg.staleness_coef,
-        seed=None,  # None → OS entropy, so each worker explores different configs
-        stats_queue=stats_queue,
-    )
-    base_env = GymWrapper(NoInfoWrapper(plr_env), device=device)
-
-    transforms = []
-    obs_spec = base_env.observation_spec["observation"]
-    is_discrete_obs = isinstance(obs_spec, OneHot)
-
-    if is_discrete_obs:
-        transforms.append(DiscreteObsToFloat())
-    elif obs_rms is not None:
-        obs_norm = ObservationNorm(in_keys=["observation"], standard_normal=True)
-        obs_norm.loc = torch.nn.Parameter(obs_rms.mean.float().clone(), requires_grad=False)
-        obs_norm.scale = torch.nn.Parameter(obs_rms.std.float().clone(), requires_grad=False)
-        transforms.append(obs_norm)
-    transforms.append(DoubleToFloat())
-    transforms.append(StepCounter())
-
-    return TransformedEnv(base_env, Compose(*transforms))
-
-
-def make_fixed_ns_eval_env(config, cfg: DictConfig, device: torch.device, obs_rms: RunningMeanStd | None = None, dtype: torch.dtype | None = None) -> TransformedEnv:
-    """Create a fixed-config NS env for held-out evaluation.
-
-    The config is pre-sampled once at training startup and never changes,
-    giving a consistent eval signal across the entire training run.
-    """
-    fixed_env = FixedNSEnv(config)
-    base_env = GymWrapper(NoInfoWrapper(fixed_env), device=device)
-
-    transforms = []
-    obs_spec = base_env.observation_spec["observation"]
-    is_discrete_obs = isinstance(obs_spec, OneHot)
-
-    if is_discrete_obs:
-        transforms.append(DiscreteObsToFloat())
-    elif obs_rms is not None:
-        obs_norm = ObservationNorm(in_keys=["observation"], standard_normal=True)
-        obs_norm.loc = torch.nn.Parameter(obs_rms.mean.float().clone(), requires_grad=False)
-        obs_norm.scale = torch.nn.Parameter(obs_rms.std.float().clone(), requires_grad=False)
-        transforms.append(obs_norm)
-    transforms.append(DoubleToFloat())
-    transforms.append(StepCounter())
-
-    return TransformedEnv(base_env, Compose(*transforms))
-
-
-def make_ns_eval_shards(
-    cfg: DictConfig,
-    device: torch.device,
-    obs_rms: RunningMeanStd | None = None,
-    dtype: torch.dtype | None = None,
-) -> list[list]:
-    """Prepare lazy eval shards for PLR runs — NO subprocesses spawned here.
-
-    Samples `plr.num_eval_configs` NS configs once using `plr.eval_seed`,
-    then groups them into shards of at most `num_eval_episodes` configs each.
-    Each shard is a list of factory callables (partial → TransformedEnv).
-
-    During eval the caller builds a ParallelEnv from one shard at a time,
-    runs the rollout, then closes it before moving to the next shard. This
-    keeps at most `num_eval_episodes` subprocesses alive at once regardless
-    of how large `num_eval_configs` is.
-
-    Returns:
-        List of lists, where each inner list contains factory callables.
-    """
-    from functools import partial
-
-    plr_cfg = cfg.env.plr
-    batch_size = cfg.training.num_eval_episodes
-
-    held_out = sample_held_out_configs(
-        sampler_key=plr_cfg.sampler_key,
-        n_configs=plr_cfg.num_eval_configs,
-        seed=plr_cfg.eval_seed,
-    )
-
-    shards: list[list] = []
-    for start in range(0, len(held_out), batch_size):
-        shard_configs = held_out[start : start + batch_size]
-        factories = [
-            partial(make_fixed_ns_eval_env, c, cfg, device, obs_rms, dtype)
-            for c in shard_configs
-        ]
-        shards.append(factories)
-    return shards
-
-
-# ---------------------------------------------------------------------------
-# Resolve device helper
-# ---------------------------------------------------------------------------
-
-def resolve_device(device_str: str) -> torch.device:
+def _resolve_device(device_str: str) -> torch.device:
     if device_str == "auto":
         return torch.device("cuda" if torch.cuda.is_available() else "cpu")
     return torch.device(device_str)
 
 
-# ---------------------------------------------------------------------------
-# Main training function
-# ---------------------------------------------------------------------------
-
 @hydra.main(version_base=None, config_path="../config", config_name="config_ant")
 def train(cfg: DictConfig) -> None:
     # ── Resolve device & seed ──────────────────────────────────────────
-    device = resolve_device(cfg.device)
-    # Network device defaults to same as device if set to "auto"
+    device = _resolve_device(cfg.device)
     if hasattr(cfg.agent, "network_device") and cfg.agent.network_device != "auto":
-        network_device = resolve_device(cfg.agent.network_device)
+        network_device = _resolve_device(cfg.agent.network_device)
     else:
         network_device = device
     # Tune PyTorch intra-op threads — small MLPs on CPU benefit from fewer threads
@@ -446,28 +135,26 @@ def train(cfg: DictConfig) -> None:
     envs_per_group = max(1, num_envs // num_groups)
     plr_enabled = cfg.env.get("plr", {}).get("enabled", False)
 
+    # Manager().Queue() uses a proxy object that works across process boundaries
+    # regardless of spawn/fork start method. Plain mp.Queue() can silently
+    # disconnect when pickled through ParallelEnv workers.
     if plr_enabled:
-        from functools import partial
-        # Manager().Queue() uses a proxy object that works across process
-        # boundaries regardless of spawn/fork start method. Plain mp.Queue()
-        # can silently disconnect when pickled through ParallelEnv workers.
         _plr_mp_manager = mp.Manager()
         plr_stats_queue = _plr_mp_manager.Queue(maxsize=2000)
-        collector_envs = [
-            ParallelEnv(
-                num_workers=envs_per_group,
-                create_env_fn=partial(make_ns_plr_env, cfg, device, obs_rms, network_dtype, plr_stats_queue),
-                serial_for_single=True,
-            )
-            for _ in range(num_groups)
-        ]
+        collector_factory = partial(make_ns_plr_env, cfg, device, obs_rms, network_dtype, plr_stats_queue)
     else:
         _plr_mp_manager = None
         plr_stats_queue = None
-        collector_envs = [
-            make_parallel_env(cfg, device, num_envs=envs_per_group, dtype=network_dtype, obs_rms=obs_rms)
-            for _ in range(num_groups)
-        ]
+        collector_factory = partial(make_single_env, cfg, device, obs_rms, network_dtype)
+
+    collector_envs = [
+        ParallelEnv(
+            num_workers=envs_per_group,
+            create_env_fn=collector_factory,
+            serial_for_single=True,
+        )
+        for _ in range(num_groups)
+    ]
 
     # Use first env only for shape logging
     env = collector_envs[0]
@@ -481,17 +168,17 @@ def train(cfg: DictConfig) -> None:
     num_eval_episodes = cfg.training.get("num_eval_episodes", 5)
     if plr_enabled:
         n_configs = cfg.env.plr.num_eval_configs
-        # Lazy shards: just factory callables, no subprocesses spawned yet.
-        # Each shard is built/torn down during eval to bound memory + processes.
         eval_shard_factories = make_ns_eval_shards(cfg, device, obs_rms=obs_rms, dtype=network_dtype)
         log.info(
             "Eval: %d held-out NS configs (seed=%d), %d parallel eval envs, %d shard(s)",
             n_configs, cfg.env.plr.eval_seed, num_eval_episodes, len(eval_shard_factories),
         )
     else:
-        # Non-PLR: single persistent eval env (small, no sharding needed)
-        eval_env_persistent = make_parallel_env(cfg, device, num_envs=num_eval_episodes, obs_rms=obs_rms, dtype=network_dtype)
-        eval_shard_factories = None
+        # Single shard of num_eval_episodes base-env instances.
+        eval_shard_factories = [
+            [partial(make_single_env, cfg, device, obs_rms, network_dtype)
+             for _ in range(num_eval_episodes)]
+        ]
 
     # ── Build PPO modules ──────────────────────────────────────────────
     # Set RPO alpha before building models (distribution class reads it)
@@ -544,6 +231,17 @@ def train(cfg: DictConfig) -> None:
     use_vtrace = cfg.agent.get("use_vtrace", False)
     if use_vtrace:
         log.info("V-trace off-policy correction enabled for async collector")
+
+    # ── Warmup torch.compile before any env teardown can race with it ──
+    # The first actor(td) call triggers dynamo tracing. If an eval env's
+    # __del__ fires concurrently (resetting num_threads), dynamo raises an
+    # AssertionError inside __del__ which Python suppresses — benign but noisy.
+    # Forcing a compile pass here ensures tracing finishes before the first
+    # eval shard is torn down.
+    with torch.no_grad():
+        _warmup_td = collector_envs[0].reset()
+        actor(_warmup_td)
+        del _warmup_td
 
     # ── Training loop ──────────────────────────────────────────────────
     total_frames = cfg.collector.total_frames
@@ -684,104 +382,20 @@ def train(cfg: DictConfig) -> None:
         if global_step >= next_eval_frame:
             did_eval_this_iter = True
             next_eval_frame += eval_every_frames
-            all_returns: list[torch.Tensor] = []
-            all_lengths: list[torch.Tensor] = []
 
-            if eval_shard_factories is not None:
-                # PLR path: build each shard on demand, tear down after use.
-                # At most `num_eval_episodes` subprocesses alive at once.
-                n_shards = len(eval_shard_factories)
-                eval_pbar = tqdm(
-                    eval_shard_factories, desc="Eval", leave=False,
-                    total=n_shards, unit="shard",
-                )
-                with set_exploration_type(ExplorationType.DETERMINISTIC), torch.no_grad():
-                    for shard_idx, factories in enumerate(eval_pbar):
-                        n_envs = len(factories)
-                        if n_envs == 1:
-                            eval_env = factories[0]()
-                        else:
-                            eval_env = ParallelEnv(
-                                num_workers=n_envs,
-                                create_env_fn=factories,
-                                serial_for_single=True,
-                            )
-
-                        shard_returns = torch.zeros(n_envs, device=device)
-                        shard_lengths = torch.zeros(n_envs, dtype=torch.long, device=device)
-                        shard_finished = torch.zeros(n_envs, dtype=torch.bool, device=device)
-
-                        td = eval_env.reset()
-                        for _ in range(cfg.training.eval_rollout_steps):
-                            td = actor(td)
-                            td = eval_env.step(td)
-
-                            reward = td["next", "reward"].squeeze(-1)
-                            done = (td["next", "terminated"] | td["next", "truncated"]).squeeze(-1)
-
-                            shard_returns += reward * ~shard_finished
-                            shard_lengths += (~shard_finished).long()
-                            shard_finished = shard_finished | done
-
-                            if shard_finished.all():
-                                break
-
-                            td = step_mdp(td)
-
-                        all_returns.append(shard_returns)
-                        all_lengths.append(shard_lengths)
-                        eval_env.close()  # tear down this shard's subprocesses
-                eval_pbar.close()
-            else:
-                # Non-PLR path: single persistent eval env
-                with set_exploration_type(ExplorationType.DETERMINISTIC), torch.no_grad():
-                    n_envs = num_eval_episodes
-                    shard_returns = torch.zeros(n_envs, device=device)
-                    shard_lengths = torch.zeros(n_envs, dtype=torch.long, device=device)
-                    shard_finished = torch.zeros(n_envs, dtype=torch.bool, device=device)
-
-                    td = eval_env_persistent.reset()
-                    for _ in range(cfg.training.eval_rollout_steps):
-                        td = actor(td)
-                        td = eval_env_persistent.step(td)
-
-                        reward = td["next", "reward"].squeeze(-1)
-                        done = (td["next", "terminated"] | td["next", "truncated"]).squeeze(-1)
-
-                        shard_returns += reward * ~shard_finished
-                        shard_lengths += (~shard_finished).long()
-                        shard_finished = shard_finished | done
-
-                        if shard_finished.all():
-                            break
-
-                        td = step_mdp(td)
-
-                    all_returns.append(shard_returns)
-                    all_lengths.append(shard_lengths)
-                n_shards = 1
-
-            ep_returns = torch.cat(all_returns)
-            ep_lengths = torch.cat(all_lengths)
-
-            eval_reward_mean = ep_returns.mean().item()
-            eval_steps = ep_lengths.float().mean().item()
-
-            # IQM: mean of returns in [25th, 75th] percentile — robust to outlier episodes
-            q1, q3 = torch.quantile(ep_returns, torch.tensor([0.25, 0.75], device=device))
-            iqm_mask = (ep_returns >= q1) & (ep_returns <= q3)
-            eval_reward_iqm = ep_returns[iqm_mask].mean().item() if iqm_mask.any() else eval_reward_mean
-
-            metrics.update({
-                "eval/reward_mean": eval_reward_mean,
-                "eval/reward_iqm": eval_reward_iqm,
-                "eval/reward_per_step": eval_reward_mean / max(eval_steps, 1),
-                "eval/step_count": eval_steps,
-            })
+            eval_results = run_eval_shards(
+                actor,
+                eval_shard_factories,
+                eval_rollout_steps=cfg.training.eval_rollout_steps,
+                device=device,
+            )
+            eval_reward_mean = eval_results["eval/reward_mean"]
+            eval_reward_iqm = eval_results["eval/reward_iqm"]
+            metrics.update({k: v for k, v in eval_results.items() if k not in ("n_shards", "n_configs")})
             log.info(
                 "[iter %d | frames %d] eval_return=%.2f  eval_iqm=%.2f  eval_steps=%.1f  (%d configs, %d shards)",
-                collect_iter, global_step, eval_reward_mean, eval_reward_iqm, eval_steps,
-                ep_returns.shape[0], n_shards,
+                collect_iter, global_step, eval_reward_mean, eval_reward_iqm,
+                eval_results["eval/step_count"], eval_results["n_configs"], eval_results["n_shards"],
             )
 
         # ── PLR buffer stats (aggregated from all worker subprocesses) ───
@@ -823,9 +437,6 @@ def train(cfg: DictConfig) -> None:
             e.close()
         except RuntimeError:
             pass  # Already closed by collector shutdown
-    if eval_shard_factories is None and eval_env_persistent is not None:
-        eval_env_persistent.close()
-
     # ── Final save ─────────────────────────────────────────────────────
     final_path = ckpt_dir / "ppo_final.pt"
     PPOAgent(actor=actor, device=device, obs_rms=obs_rms).save(str(final_path))
