@@ -12,7 +12,7 @@ metric: eval/reward_iqm
 direction: maximize
 
 fixed_overrides:
-  collector.total_frames: 1_000_000
+  collector.total_frames: 10_000_000
   training.eval_ratio: 0.1
   env.plr.score_temp: 0.5  # fixed at tuned value from temperature search
 

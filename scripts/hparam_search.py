@@ -30,6 +30,8 @@ import numpy as np
 import wandb
 import yaml
 
+from dotenv import load_dotenv
+load_dotenv()
 
 # ---------------------------------------------------------------------------
 # Parameter sampling
