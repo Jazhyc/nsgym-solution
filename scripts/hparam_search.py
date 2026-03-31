@@ -107,6 +107,7 @@ def main():
             f"wandb.project={wandb_project}",
             f"wandb.group={wandb_group}",
             f"wandb.name=trial_{trial_idx:02d}",
+            f"wandb.dir=logs/wandb",
         ]
 
         print(f"[Trial {trial_idx + 1}/{n_trials}]  seed={trial_seed}")
@@ -152,8 +153,10 @@ def main():
     else:
         print("No successful trials — check train.py output above.")
 
-    # Save results JSON
-    results_path = Path("hparam_results.json")
+    # Save results JSON — named after the config file, stored under results/
+    results_dir = Path("results")
+    results_dir.mkdir(exist_ok=True)
+    results_path = results_dir / f"{hparam_config_path.stem}.json"
     results_path.write_text(json.dumps(results, indent=2))
     print(f"\nFull results saved to {results_path}")
 

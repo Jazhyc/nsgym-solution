@@ -20,7 +20,8 @@ direction: maximize  # maximize | minimize
 
 # Overrides applied to every trial (use to shorten runs for search)
 fixed_overrides:
-  collector.total_frames: 1_000_000
+  collector.total_frames: 10_000_000
+  training.eval_ratio: 0.2
 
 # WandB project for trial runs and the summary run
 wandb:

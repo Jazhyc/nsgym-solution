@@ -1,0 +1,34 @@
+# Hyperparameter search config for PLR sampling parameters.
+# Sweeps replay_prob and staleness_coef jointly to find the best
+# explore/exploit balance and buffer diversity for Ant-v5.
+#
+# Run with:
+#   python scripts/hparam_search.py config/hparam/plr_sampling.yaml
+
+env: ant
+n_trials: 20
+seed: 1
+metric: eval/reward_iqm
+direction: maximize
+
+fixed_overrides:
+  collector.total_frames: 1_000_000
+  training.eval_ratio: 0.1
+  env.plr.score_temp: 0.5  # fixed at tuned value from temperature search
+
+wandb:
+  project: nsgym-hparam-ant
+  group: plr_sampling_search
+
+params:
+  - name: env.plr.replay_prob
+    type: float
+    distribution: uniform
+    low: 0.2
+    high: 0.8
+
+  - name: env.plr.staleness_coef
+    type: float
+    distribution: uniform
+    low: 0.05
+    high: 0.4
