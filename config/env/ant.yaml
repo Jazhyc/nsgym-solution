@@ -7,11 +7,17 @@ normalize_obs: true
 normalize_obs_init_steps: 1000  # random steps for initial stats bootstrap
 normalize_reward: true          # VecNormalize-style reward scaling
 
+# ── NS training mode ─────────────────────────────────────────────────────
+# ns_baseline: true  → random NS config per episode, no PLR curriculum.
+#                      Eval uses same held-out NS configs as PLR (plr block below).
+# ns_baseline: false → ignored if plr.enabled=true; uses stationary env otherwise.
+ns_baseline: true
+
 # ── Prioritized Level Replay (PLR) ───────────────────────────────────────
 # Set enabled: true to rotate NS configs during training via PLR.
 # Eval always uses a fixed held-out set (eval_seed) regardless of this flag.
 plr:
-  enabled: true
+  enabled: false
   sampler_key: ant            # key into NS_ENV_SAMPLERS
   capacity: 200               # larger buffer for the more complex Ant param space
   replay_prob: 0.75            # P(replay existing level) once buffer is warm

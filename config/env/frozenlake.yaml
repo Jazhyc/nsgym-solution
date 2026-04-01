@@ -8,6 +8,12 @@ frame_skip: 1
 normalize_obs: false
 normalize_reward: false   # Rewards are binary (0 or 1); no scaling needed
 
+# ── NS training mode ─────────────────────────────────────────────────────
+# ns_baseline: true  → random NS config per episode, no PLR curriculum.
+#                      Eval uses same held-out NS configs as PLR (plr block below).
+# ns_baseline: false → ignored if plr.enabled=true; uses stationary env otherwise.
+ns_baseline: false
+
 # ── Prioritized Level Replay (PLR) ───────────────────────────────────────
 # Set enabled: true to rotate NS configs during training via PLR.
 # Eval always uses a fixed held-out set (eval_seed) regardless of this flag.

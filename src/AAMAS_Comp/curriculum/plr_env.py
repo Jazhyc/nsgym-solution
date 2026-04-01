@@ -171,6 +171,46 @@ class PLREnv(gym.Env):
         super().close()
 
 
+class RandomNSEnv(gym.Env):
+    """NS env that randomly samples a new config on every reset() — no PLR.
+
+    Used for the NS baseline: trains on uniformly-random NS configs without
+    curriculum, enabling a fair comparison against PLR on the same held-out
+    NS evaluation configs.
+
+    Args:
+        sampler_key: Key into NS_ENV_SAMPLERS ("cartpole", "ant", "frozenlake").
+        seed:        RNG seed (None → OS entropy so each worker differs).
+    """
+
+    def __init__(self, sampler_key: str = "cartpole", seed: int | None = None) -> None:
+        super().__init__()
+        self._sampler = NS_ENV_SAMPLERS[sampler_key](seed=seed)
+        self._env: gym.Env | None = None
+
+        # Build a throwaway env to read spaces, then discard it
+        config = self._sampler.sample()
+        tmp = _build_ns_env(config)
+        self.observation_space = tmp.observation_space
+        self.action_space = tmp.action_space
+        tmp.close()
+
+    def reset(self, *, seed=None, options=None):
+        config = self._sampler.sample()
+        if self._env is not None:
+            self._env.close()
+        self._env = _build_ns_env(config)
+        return self._env.reset(seed=seed, options=options)
+
+    def step(self, action):
+        return self._env.step(action)
+
+    def close(self):
+        if self._env is not None:
+            self._env.close()
+        super().close()
+
+
 class FixedNSEnv(gym.Env):
     """Fixed-config NS env for held-out evaluation.
 

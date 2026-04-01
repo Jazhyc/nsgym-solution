@@ -25,7 +25,7 @@ from torchrl.envs import (
 from torchrl.envs.transforms import Transform
 from torchrl.envs.libs.gym import GymWrapper
 
-from AAMAS_Comp.curriculum import PLREnv, FixedNSEnv, sample_held_out_configs
+from AAMAS_Comp.curriculum import PLREnv, FixedNSEnv, RandomNSEnv, sample_held_out_configs
 from AAMAS_Comp.envs.wrappers import NoInfoWrapper, RunningMeanStd
 
 log = logging.getLogger(__name__)
@@ -162,6 +162,24 @@ def make_ns_plr_env(
         stats_queue=stats_queue,
     )
     base_env = GymWrapper(NoInfoWrapper(plr_env), device=device)
+    return TransformedEnv(base_env, Compose(*_make_env_transforms(base_env, obs_rms)))
+
+
+def make_ns_random_env(
+    cfg: DictConfig,
+    device: torch.device,
+    obs_rms: RunningMeanStd | None = None,
+    dtype: torch.dtype | None = None,
+) -> TransformedEnv:
+    """Create a randomly-sampled NS env (no PLR) for NS baseline training.
+
+    Samples a fresh NS config on every reset() using uniform random sampling —
+    no PLR scoring or replay.  Eval uses the same held-out NS configs as PLR
+    (make_ns_eval_shards) for a fair comparison.
+    """
+    plr_cfg = cfg.env.plr
+    random_env = RandomNSEnv(sampler_key=plr_cfg.sampler_key, seed=None)
+    base_env = GymWrapper(NoInfoWrapper(random_env), device=device)
     return TransformedEnv(base_env, Compose(*_make_env_transforms(base_env, obs_rms)))
 
 

@@ -55,6 +55,7 @@ from AAMAS_Comp.envs.torchrl_factory import (
     initialize_obs_norm,
     make_single_env,
     make_ns_plr_env,
+    make_ns_random_env,
     make_ns_eval_shards,
 )
 from AAMAS_Comp.evaluation.utils import run_eval_shards
@@ -134,6 +135,7 @@ def train(cfg: DictConfig) -> None:
     num_groups = cfg.collector.get("num_groups", 1)
     envs_per_group = max(1, num_envs // num_groups)
     plr_enabled = cfg.env.get("plr", {}).get("enabled", False)
+    ns_baseline = cfg.env.get("ns_baseline", False)
 
     # Manager().Queue() uses a proxy object that works across process boundaries
     # regardless of spawn/fork start method. Plain mp.Queue() can silently
@@ -142,6 +144,10 @@ def train(cfg: DictConfig) -> None:
         _plr_mp_manager = mp.Manager()
         plr_stats_queue = _plr_mp_manager.Queue(maxsize=2000)
         collector_factory = partial(make_ns_plr_env, cfg, device, obs_rms, network_dtype, plr_stats_queue)
+    elif ns_baseline:
+        _plr_mp_manager = None
+        plr_stats_queue = None
+        collector_factory = partial(make_ns_random_env, cfg, device, obs_rms, network_dtype)
     else:
         _plr_mp_manager = None
         plr_stats_queue = None
@@ -158,15 +164,16 @@ def train(cfg: DictConfig) -> None:
 
     # Use first env only for shape logging
     env = collector_envs[0]
+    train_mode = "PLR" if plr_enabled else ("NS-baseline" if ns_baseline else "stationary")
     log.info(
-        "Env: %s | PLR=%s | num_groups=%d | envs_per_group=%d | total_envs=%d | obs=%s  act=%s",
-        cfg.env.id, plr_enabled, num_groups, envs_per_group, num_groups * envs_per_group,
+        "Env: %s | mode=%s | num_groups=%d | envs_per_group=%d | total_envs=%d | obs=%s  act=%s",
+        cfg.env.id, train_mode, num_groups, envs_per_group, num_groups * envs_per_group,
         env.observation_spec["observation"].shape,
         env.action_spec.shape,
     )
 
     num_eval_episodes = cfg.training.get("num_eval_episodes", 5)
-    if plr_enabled:
+    if plr_enabled or ns_baseline:
         n_configs = cfg.env.plr.num_eval_configs
         eval_shard_factories = make_ns_eval_shards(cfg, device, obs_rms=obs_rms, dtype=network_dtype)
         log.info(
