@@ -13,7 +13,7 @@ direction: maximize
 
 fixed_overrides:
   collector.total_frames: 10_000_000
-  training.eval_ratio: 0.1
+  training.eval_ratio: 0.2
   env.plr.score_temp: 0.5  # fixed at tuned value from temperature search
 
 wandb:
