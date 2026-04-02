@@ -79,6 +79,7 @@ def main():
     rng = np.random.default_rng(sampler_seed)
 
     train_script = Path(__file__).parent / "train.py"
+    project_root = Path(__file__).parent.parent.resolve()
     results: list[dict] = []
 
     print(f"Starting random search: {n_trials} trials | metric={metric_key} ({direction})")
@@ -109,7 +110,7 @@ def main():
             f"wandb.project={wandb_project}",
             f"wandb.group={wandb_group}",
             f"wandb.name=trial_{trial_idx:02d}",
-            f"wandb.dir=logs/wandb",
+            f"wandb.dir={project_root}/logs/wandb/hparam/{wandb_group}",
         ]
 
         print(f"[Trial {trial_idx + 1}/{n_trials}]  seed={trial_seed}")
