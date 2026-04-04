@@ -552,6 +552,7 @@ def make_ppo_models(
 
     return {
         "actor": actor,
+        "critic": critic,
         "advantage": advantage,
         "loss_module": loss_module,
         "optimizer": optimizer,
@@ -579,12 +580,14 @@ class PPOAgent(ModelFreeAgent):
     def __init__(
         self,
         actor: ProbabilisticActor,
+        critic = None,
         device: torch.device | str = "cpu",
         deterministic: bool = True,
         obs_rms: Any | None = None,
     ) -> None:
         super().__init__()
         self.actor = actor
+        self.critic = critic
         self.device = torch.device(device)
         self.deterministic = deterministic
 
@@ -646,6 +649,8 @@ class PPOAgent(ModelFreeAgent):
     def save(self, path: str) -> None:
         """Persist the actor (and obs normalisation stats) so it can be loaded later."""
         ckpt: dict[str, Any] = {"actor": self.actor}
+        if self.critic is not None:
+            ckpt["critic"] = self.critic
         if self._obs_mean is not None:
             ckpt["obs_rms"] = {"mean": self._obs_mean.cpu(), "std": self._obs_std.cpu()}
         torch.save(ckpt, path)

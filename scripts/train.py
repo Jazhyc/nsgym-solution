@@ -31,6 +31,8 @@ import torch._dynamo
 from omegaconf import DictConfig, OmegaConf
 from tqdm import tqdm
 
+from AAMAS_Comp.agent import compute_and_save_fisher
+
 # EnvBase.__del__ calls set_num_threads() to restore subprocess state.  If
 # this fires while dynamo is recompiling (e.g. async collector background
 # thread), the guard-check assertion fails inside __del__ and Python prints
@@ -196,6 +198,7 @@ def train(cfg: DictConfig) -> None:
 
     models = make_ppo_models(env, cfg, device=device, network_device=network_device, dtype=network_dtype)
     actor = models["actor"]
+    critic = models.get("critic") 
     advantage_module = models["advantage"]
     loss_module = models["loss_module"]
     optimizer = models["optimizer"]
@@ -434,7 +437,7 @@ def train(cfg: DictConfig) -> None:
         # ── Checkpointing ─────────────────────────────────────────────
         if collect_iter % cfg.training.save_interval == 0 and collect_iter > 0:
             ckpt_path = ckpt_dir / f"ppo_iter_{collect_iter}.pt"
-            agent = PPOAgent(actor=actor, device=device,
+            agent = PPOAgent(actor=actor, critic=critic, device=device,
                              obs_rms=obs_rms)
             agent.save(str(ckpt_path))
             log.info("Saved checkpoint → %s", ckpt_path)
@@ -448,7 +451,8 @@ def train(cfg: DictConfig) -> None:
             pass  # Already closed by collector shutdown
     # ── Final save ─────────────────────────────────────────────────────
     final_path = ckpt_dir / "ppo_final.pt"
-    PPOAgent(actor=actor, device=device, obs_rms=obs_rms).save(str(final_path))
+    print(critic)
+    PPOAgent(actor=actor, critic=critic, device=device, obs_rms=obs_rms).save(str(final_path))
     log.info("Training complete. Final model → %s", final_path)
 
     if _plr_mp_manager is not None:
@@ -464,6 +468,15 @@ def train(cfg: DictConfig) -> None:
             _json.dumps({"eval/reward_iqm": best_eval_iqm})
         )
         log.info("Wrote hparam metric to %s (best eval/reward_iqm=%.4f)", hparam_output_path, best_eval_iqm)
+
+    compute_and_save_fisher(
+        model_path=str(final_path),
+        output_path=str(final_path),
+        actor=actor,
+        tensordict_data=tensordict_data,
+        device=str(device),   # str(device) ..
+        n_samples=cfg.get("fisher_samples", 2000)
+    )
 
     if cfg.wandb.enabled:
         wandb.finish()

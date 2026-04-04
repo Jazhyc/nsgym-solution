@@ -26,13 +26,15 @@ def get_agent(env_id: str):
         ####################
         ## YOUR CODE HERE ##
         ####################
-        return MyModelFreeAgent("models/ppo_ant/ppo_final.pt", device="cuda")
+        return MyModelFreeAgent("models/ppo_ant/ppo_final.pt", 
+                                  env_id=env_id, device="cuda")
 
     elif env_id == "FrozenLake-v1":
         ####################
         ## YOUR CODE HERE ##
         ####################
-        return MyModelFreeAgent("models/ppo_frozenlake/ppo_final.pt", device="cpu")
+        return MyModelFreeAgent("models/ppo_frozenlake/ppo_final.pt", 
+                                device="cpu")
 
     elif env_id == "CartPole-v1":
         ####################
