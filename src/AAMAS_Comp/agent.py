@@ -10,6 +10,7 @@ from torchrl.envs.utils import ExplorationType, set_exploration_type
 from AAMAS_Comp.base_agent import ModelFreeAgent, ModelBasedAgent
 
 # ── Official ObGD ─────────────────────────────────────────────────────────────
+# Taken from: https://github.com/mohmdelsayed/streaming-drl/blob/main/optim.py
 class ObGD(torch.optim.Optimizer):
     def __init__(self, params, lr=1.0, gamma=0.99, lamda=0.8, kappa=2.0):
         defaults = dict(lr=lr, gamma=gamma, lamda=lamda, kappa=kappa)
@@ -42,16 +43,35 @@ class ObGD(torch.optim.Optimizer):
 # ── Programmatic reward functions ─────────────────────────────────────────────
 
 def compute_reward_ant(obs_state, prev_obs_state, action):
+    # reward = healthy_reward + forward_reward - ctrl_cost - contact_cost.
     torso_z        = float(obs_state[0])
+    # healthy if state space values are finite and z-coordinate of torso
+    # is in [0.2, 1.0]
     healthy_reward = 1.0 if 0.2 <= torso_z <= 1.0 else 0.0
+    # forward reward, positive if Ant moves forward in x-direction
+    # idx=13 dives x-coord velocity of the torso
+    # the froward_reward_weigth is by default 1 hence it is 1 here
     forward_reward = float(obs_state[13])
+    # ctrl_cost is a negative reward that penalizes the Ant for taking
+    # actions that are too large, the weight is by default 0.5
+    # quantified by euclidian norm of the action vector
     ctrl_cost      = 0.5 * float(np.sum(action ** 2))
-    if len(obs_state) >= 105:
-        cfrc_clip    = np.clip(obs_state[27:105], -1.0, 1.0)
-        contact_cost = 5e-4 * float(np.sum(cfrc_clip ** 2))
-    else:
-        contact_cost = 0.0
-    return forward_reward + healthy_reward - ctrl_cost - contact_cost
+    # if len(obs_state) >= 105:
+        # in v4 of the environment use_contract-force is False and this
+        # does not exist
+    #     cfrc_clip    = np.clip(obs_state[27:105], -1.0, 1.0)
+    #     contact_cost = 5e-4 * float(np.sum(cfrc_clip ** 2))
+    # else:
+      # contact_cost = 0.0
+    total_reward = healthy_reward + forward_reward - ctrl_cost # - contact_cost
+
+    # print("computed healthy reward", healthy_reward)
+    # print("computed forward reward", forward_reward)
+    # print("computed ctrl_cost", ctrl_cost)
+    # print("computed contact_cost", contact_cost)
+    # print("computed total_reward", total_reward)
+
+    return total_reward
 
 def compute_reward_cartpole(obs_state):
     terminated = abs(float(obs_state[0])) > 2.4 or abs(float(obs_state[2])) > 0.2094
@@ -67,40 +87,6 @@ REWARD_FNS = {
     "CartPole-v1":   compute_reward_cartpole,
     "FrozenLake-v1": compute_reward_frozenlake,
 }
-
-def is_terminal(env_id: str, raw_state: np.ndarray, relative_time: int) -> bool:
-    if env_id == "Ant-v5":
-        # Termination: torso z not in [0.2, 1.0] or any non-finite value
-        # Truncation: 1000 timesteps
-        torso_z = float(raw_state[0])
-        unhealthy = not (0.2 <= torso_z <= 1.0) or not np.all(np.isfinite(raw_state))
-        truncated = relative_time >= 1000
-        return unhealthy or truncated
-
-    elif env_id == "CartPole-v1":
-        # Termination: pole angle > ±12° (0.2094 rad) or cart pos > ±2.4
-        # Truncation: 500 timesteps
-        cart_pos   = float(raw_state[0])
-        pole_angle = float(raw_state[2])
-        terminated = abs(cart_pos) > 2.4 or abs(pole_angle) > 0.2094
-        truncated  = relative_time >= 500
-        return terminated or truncated
-
-    elif env_id == "FrozenLake-v1":
-        # Termination: reached goal (last cell) or fell in hole
-        # For FrozenLake we'd need the map to know hole positions,
-        # but we can detect goal (reward=1 was just given) or
-        # truncation by time. Holes are harder — use relative_time reset instead.
-        grid_size  = int(np.sqrt(len(raw_state)))  # 4 or 8
-        position   = int(np.argmax(raw_state))
-        goal       = grid_size * grid_size - 1
-        truncation = (grid_size == 4 and relative_time >= 100) or \
-                        (grid_size == 8 and relative_time >= 200)
-        # goal reached = terminal; hole detection falls back to relative_time drop
-        return position == goal or truncation
-
-    return False
-
 
 
 class MyModelFreeAgent(ModelFreeAgent):
@@ -120,7 +106,7 @@ class MyModelFreeAgent(ModelFreeAgent):
         device: str = "cpu",
         lam: float            = 0.8,
         gamma: float          = 0.99,
-        lr: float             = 1.0,
+        lr: float             = 1.0, # 1.0,
         kappa_pi: float       = 3.0,
         kappa_v: float        = 2.0,
         entropy_coeff: float  = 0.01,
@@ -277,8 +263,8 @@ class MyModelFreeAgent(ModelFreeAgent):
         #           entropy_pi  = -entropy_coeff * dist.entropy().sum() * sign(δ)
         #           (log_prob_pi + entropy_pi).backward()
         log_prob, dist = self._actor_forward(s, a)
-        # log_prob_pi = -log_prob.sum()  # TODO double check log prob already negated?
-        log_prob_pi = log_prob.sum() 
+        # Check sign of log_prob
+        log_prob_pi = -log_prob.sum() 
         entropy_pi  = (-self.entropy_coeff
                        * dist.entropy().sum()
                        * torch.sign(torch.tensor(delta)).item())
@@ -311,7 +297,13 @@ class MyModelFreeAgent(ModelFreeAgent):
         raw_state  = obs["state"]        if isinstance(obs, dict) else obs
         relative_time = obs.get("relative_time", None) if isinstance(obs, dict) else None
 
-        done = is_terminal(self.env_id, raw_state, relative_time or 0)
+        # Episodes is finished if the relative time resets back to 0
+        done = (
+            self._prev_relative_time is not None
+            and relative_time is not None
+            and relative_time < self._prev_relative_time
+        )
+        self._prev_relative_time = relative_time
         s = self._normalise(raw_state)
 
         if self.online_learning and self._prev_state is not None:
