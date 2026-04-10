@@ -215,4 +215,4 @@ checkpoints/
 !config/env
 *.pt
 .vscode
-
+.serena/

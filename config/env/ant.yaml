@@ -3,7 +3,7 @@ id: Ant-v5
 frame_skip: 5
 
 # Observation / reward transforms applied by TorchRL
-frame_stack: 4                  # number of consecutive frames to stack along obs dim (1 = disabled)
+frame_stack: 1                  # number of consecutive frames to stack along obs dim (1 = disabled)
 normalize_obs: true
 normalize_obs_init_steps: 1000  # random steps for initial stats bootstrap
 normalize_reward: true          # VecNormalize-style reward scaling
@@ -22,8 +22,8 @@ plr:
   sampler_key: ant            # key into NS_ENV_SAMPLERS
   capacity: 200               # larger buffer for the more complex Ant param space
   replay_prob: 0.75            # P(replay existing level) once buffer is warm
-  score_temp: 0.75             # softmax temperature (lower → greedier replay)
-  staleness_coef: 0.1         # weight for staleness in sampling distribution
+  score_temp: 0.5             # softmax temperature (lower → greedier replay)
+  staleness_coef: 0.35         # weight for staleness in sampling distribution
   num_eval_configs: 16        # distinct held-out configs for evaluation
                               # Evaluated in shards of training.num_eval_episodes envs.
                               # Can be any value ≥ 1 independent of num_eval_episodes.
