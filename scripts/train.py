@@ -22,6 +22,10 @@ import os
 import warnings
 from pathlib import Path
 
+# Suppress FutureWarnings from torchrl (Python 3.13 compatibility issues)
+# Must be registered before any torchrl import, as the warnings fire at module load time.
+warnings.filterwarnings("ignore", category=FutureWarning, module="torchrl.modules.mcts.scores")
+
 import multiprocessing as mp
 from functools import partial
 
@@ -44,9 +48,6 @@ torch._dynamo.config.suppress_errors = True
 import wandb
 
 from AAMAS_Comp.optimizers.cbp import ContinualBackpropagation
-
-# Suppress FutureWarnings from torchrl (Python 3.13 compatibility issues)
-warnings.filterwarnings("ignore", category=FutureWarning, module="torchrl.modules.mcts.scores")
 
 from torchrl.collectors import MultiAsyncCollector
 from torchrl.envs import ParallelEnv

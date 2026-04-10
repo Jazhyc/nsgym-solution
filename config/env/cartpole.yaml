@@ -3,6 +3,7 @@ id: CartPole-v1
 frame_skip: 1
 
 # CartPole has a continuous 4-D observation; normalization helps.
+frame_stack: 2                  # number of consecutive frames to stack along obs dim (1 = disabled)
 normalize_obs: true
 normalize_obs_init_steps: 1000
 normalize_reward: false   # Rewards are +1 per step; no scaling needed

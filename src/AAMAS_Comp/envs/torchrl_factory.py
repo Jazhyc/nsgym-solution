@@ -15,6 +15,7 @@ from omegaconf import DictConfig
 
 from torchrl.data import OneHot, UnboundedContinuous
 from torchrl.envs import (
+    CatFrames,
     Compose,
     DoubleToFloat,
     ObservationNorm,
@@ -95,6 +96,7 @@ def initialize_obs_norm(
 def _make_env_transforms(
     base_env,
     obs_rms: RunningMeanStd | None,
+    frame_stack: int = 1,
 ) -> list:
     """Return the TorchRL transform list appropriate for this env."""
     transforms = []
@@ -108,6 +110,8 @@ def _make_env_transforms(
         transforms.append(obs_norm)
     transforms.append(DoubleToFloat())
     transforms.append(StepCounter())
+    if frame_stack > 1:
+        transforms.append(CatFrames(N=frame_stack, dim=-1, in_keys=["observation"]))
     return transforms
 
 
@@ -118,8 +122,9 @@ def make_single_env(
     dtype: torch.dtype | None = None,
 ) -> TransformedEnv:
     """Create a single TorchRL TransformedEnv instance."""
+    frame_stack = cfg.env.get("frame_stack", 1)
     base_env = GymWrapper(NoInfoWrapper(gym.make(cfg.env.id)), device=device)
-    return TransformedEnv(base_env, Compose(*_make_env_transforms(base_env, obs_rms)))
+    return TransformedEnv(base_env, Compose(*_make_env_transforms(base_env, obs_rms, frame_stack)))
 
 
 def make_parallel_env(
@@ -152,6 +157,7 @@ def make_ns_plr_env(
     run in separate ParallelEnv subprocesses.
     """
     plr_cfg = cfg.env.plr
+    frame_stack = cfg.env.get("frame_stack", 1)
     plr_env = PLREnv(
         sampler_key=plr_cfg.sampler_key,
         plr_capacity=plr_cfg.capacity,
@@ -162,7 +168,7 @@ def make_ns_plr_env(
         stats_queue=stats_queue,
     )
     base_env = GymWrapper(NoInfoWrapper(plr_env), device=device)
-    return TransformedEnv(base_env, Compose(*_make_env_transforms(base_env, obs_rms)))
+    return TransformedEnv(base_env, Compose(*_make_env_transforms(base_env, obs_rms, frame_stack)))
 
 
 def make_ns_random_env(
@@ -178,9 +184,10 @@ def make_ns_random_env(
     (make_ns_eval_shards) for a fair comparison.
     """
     plr_cfg = cfg.env.plr
+    frame_stack = cfg.env.get("frame_stack", 1)
     random_env = RandomNSEnv(sampler_key=plr_cfg.sampler_key, seed=None)
     base_env = GymWrapper(NoInfoWrapper(random_env), device=device)
-    return TransformedEnv(base_env, Compose(*_make_env_transforms(base_env, obs_rms)))
+    return TransformedEnv(base_env, Compose(*_make_env_transforms(base_env, obs_rms, frame_stack)))
 
 
 def make_fixed_ns_eval_env(
@@ -191,9 +198,10 @@ def make_fixed_ns_eval_env(
     dtype: torch.dtype | None = None,
 ) -> TransformedEnv:
     """Create a fixed-config NS env for held-out evaluation."""
+    frame_stack = cfg.env.get("frame_stack", 1)
     fixed_env = FixedNSEnv(config)
     base_env = GymWrapper(NoInfoWrapper(fixed_env), device=device)
-    return TransformedEnv(base_env, Compose(*_make_env_transforms(base_env, obs_rms)))
+    return TransformedEnv(base_env, Compose(*_make_env_transforms(base_env, obs_rms, frame_stack)))
 
 
 def make_ns_eval_shards(

@@ -3,6 +3,7 @@ id: Ant-v5
 frame_skip: 5
 
 # Observation / reward transforms applied by TorchRL
+frame_stack: 4                  # number of consecutive frames to stack along obs dim (1 = disabled)
 normalize_obs: true
 normalize_obs_init_steps: 1000  # random steps for initial stats bootstrap
 normalize_reward: true          # VecNormalize-style reward scaling
