@@ -174,6 +174,7 @@ class PLREnv(gym.Env):
             stats = self.plr.stats()
             stats["plr/replay_fraction"] = self._replay_count / self._episode_count
             stats["accel/mutation_fraction"] = self._mutation_count / self._episode_count
+            stats["plr/episode_return"] = self._episode_return
             try:
                 self._stats_queue.put_nowait(stats)
             except Exception:

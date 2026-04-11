@@ -15,7 +15,7 @@ hydra:
 collector:
   num_envs: 24                # total parallel environments (num_groups * envs_per_group)
   num_groups: 2               # async collector groups: 1 collecting while 1 is trained on (max 1-step staleness)
-  total_frames: 1_000_000  # 10_000_000     # total frames to collect across all training
+  total_frames: 10_000_000  # 10_000_000     # total frames to collect across all training
   frames_per_batch: 2560      # frames to collect before each training epoch (increased for efficiency)
   max_frames_per_traj: 1000   # max steps per episode before truncation (env horizon)
 
