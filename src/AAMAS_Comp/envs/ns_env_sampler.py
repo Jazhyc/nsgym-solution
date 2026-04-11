@@ -51,7 +51,7 @@ SCHEDULER_SPACE: dict[str, dict[str, tuple]] = {
     "RandomScheduler":                {"probability":          (0.01, 0.5)},
     "MemorylessScheduler":            {"p":                    (0.001, 0.1)},
     "BurstScheduler":                 {"on_duration":          (10, 200),
-                                       "off_duration":         (100, 2000)},
+                                       "off_duration":         (100, 1000)},
     "DecayingProbabilityScheduler":   {"initial_probability":  (0.1, 0.9),
                                        "decay_rate":           (1e-5, 1e-3)},
 }
@@ -94,7 +94,7 @@ SCALAR_UPDATE_FN_SPACE: dict[str, dict[str, tuple]] = {
     # Smooth linear ramp from start_val to end_val over T steps
     "LinearInterpolation": {"start_val":  (-10.0, 10.0),
                             "end_val":    (-10.0, 10.0),
-                            "T":          (10000, 500000)},
+                            "T":          (50, 1000)},
 }
 
 DISTRIBUTION_UPDATE_FN_SPACE: dict[str, dict[str, tuple]] = {
@@ -366,7 +366,7 @@ ANT_PARAM_SPECS: list[ParamSpec] = [
                                    "hi":    (0.5, 5.0)},
             "LinearInterpolation": {"start_val": (0.2, 1.0),
                                     "end_val":   (0.05, 3.0),
-                                    "T":         (10000, 500000)},
+                                    "T":         (100, 1000)},
         },
         required=False,
         include_prob=0.6,
