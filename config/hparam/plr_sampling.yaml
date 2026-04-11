@@ -23,7 +23,6 @@ fixed_overrides:
   training.eval_ratio: 0.2
   env.plr.score_temp: 0.5  # fixed at tuned value from temperature search
   hydra.run.dir: logs/hparam/plr_sampling_search
-  wandb.dir: logs/wandb/hparam/plr_sampling_search
 
 wandb:
   project: nsgym-hparam-ant

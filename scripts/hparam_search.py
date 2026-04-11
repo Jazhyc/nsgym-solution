@@ -178,10 +178,13 @@ def main():
             ] + [r.get(k) for k in param_names]
             table.add_data(*row)
 
+        summary_dir = project_root / "logs" / "wandb" / "hparam" / wandb_group
+        summary_dir.mkdir(parents=True, exist_ok=True)
         summary_run = wandb.init(
             project=wandb_project,
             group=wandb_group,
             name="hparam_summary",
+            dir=str(summary_dir),
             config={
                 "n_trials": n_trials,
                 "metric": metric_key,

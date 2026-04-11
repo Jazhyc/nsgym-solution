@@ -25,7 +25,6 @@ fixed_overrides:
   env.plr.score_temp: 0.5
   env.plr.staleness_coef: 0.35
   hydra.run.dir: logs/hparam/accel_mutation_search
-  wandb.dir: logs/wandb/hparam/accel_mutation_search
 
 wandb:
   project: nsgym-hparam-ant

@@ -30,7 +30,6 @@ fixed_overrides:
   collector.total_frames: 10_000_000
   training.eval_ratio: 0.2
   hydra.run.dir: logs/hparam/temperature_search
-  wandb.dir: logs/wandb/hparam/temperature_search
 
 # WandB project for trial runs and the summary run
 wandb:

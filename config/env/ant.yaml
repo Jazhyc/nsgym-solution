@@ -21,7 +21,7 @@ plr:
   enabled: true
   sampler_key: ant            # key into NS_ENV_SAMPLERS
   capacity: 200               # larger buffer for the more complex Ant param space
-  replay_prob: 0.75            # P(replay existing level) once buffer is warm
+  replay_prob: 0.8            # P(replay existing level) once buffer is warm
   score_temp: 0.5             # softmax temperature (lower → greedier replay)
   staleness_coef: 0.35         # weight for staleness in sampling distribution
   num_eval_configs: 16        # distinct held-out configs for evaluation
