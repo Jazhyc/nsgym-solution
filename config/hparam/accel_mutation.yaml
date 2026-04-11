@@ -10,6 +10,13 @@ seed: 2
 metric: eval/reward_iqm
 direction: maximize
 
+hydra:
+  run:
+    dir: logs/runs/${now:%Y-%m-%d}/${now:%H-%M-%S}
+  sweep:
+    dir: logs/multirun/${now:%Y-%m-%d}/${now:%H-%M-%S}
+    subdir: ${hydra.job.num}
+
 fixed_overrides:
   collector.total_frames: 10_000_000
   training.eval_ratio: 0.2

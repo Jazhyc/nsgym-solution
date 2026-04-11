@@ -2,7 +2,9 @@
 PLREnv — gymnasium wrapper that embeds a PLRBuffer.
 
 On every reset():
-  1. Scores the previous episode (episode return as proxy).
+  1. Scores the previous episode using mean |advantage| written by the main
+     process after GAE (correct learning-potential signal).  Falls back to
+     episode return if the score array hasn't been populated yet (first batch).
   2. Calls plr.update() to update the buffer.
   3. Samples the next config from the buffer.
   4. Rebuilds the underlying NS env from that config.
@@ -114,6 +116,8 @@ class PLREnv(gym.Env):
         staleness_coef: float = 0.1,
         seed: int | None = None,
         stats_queue=None,
+        worker_idx: int = 0,
+        score_array=None,
     ) -> None:
         super().__init__()
         sampler = NS_ENV_SAMPLERS[sampler_key](seed=seed)
@@ -131,6 +135,8 @@ class PLREnv(gym.Env):
         self._episode_return: float = 0.0
         self._env: gym.Env | None = None
         self._stats_queue = stats_queue
+        self._worker_idx: int = worker_idx
+        self._score_array = score_array
         self._episode_count: int = 0
         self._replay_count: int = 0
         self._mutation_count: int = 0
@@ -143,9 +149,17 @@ class PLREnv(gym.Env):
         tmp.close()
 
     def reset(self, *, seed=None, options=None):
-        # Score the episode that just ended (skip before first episode)
+        # Score the episode that just ended (skip before first episode).
+        # Prefer mean |advantage| written by the main process after GAE (correct
+        # learning-potential signal).  Fall back to episode return on the first
+        # batch before the score array has been populated (value == 0.0).
         if self._level_id is not None:
-            self.plr.update(self._level_id, self._episode_return)
+            if self._score_array is not None:
+                td_score = float(self._score_array[self._worker_idx])
+                score = td_score if td_score > 0.0 else self._episode_return
+            else:
+                score = self._episode_return
+            self.plr.update(self._level_id, score)
 
         # Sample next config and rebuild env
         self._level_id, config = self.plr.sample()

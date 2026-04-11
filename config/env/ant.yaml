@@ -29,6 +29,6 @@ plr:
                               # Can be any value ≥ 1 independent of num_eval_episodes.
   eval_seed: 42               # separate seed so eval configs differ from training
   # ── ACCEL mutation (set mutation_prob > 0 to enable) ─────────────────────
-  mutation_prob: 0.1          # fraction of explore steps that mutate a high-score config
+  mutation_prob: 0          # fraction of explore steps that mutate a high-score config
                               # 0.0 = pure PLR; 0.5 = half of explores are mutations
   mutation_sigma: 0.2         # noise scale: std = sigma * (hi - lo) per kwarg

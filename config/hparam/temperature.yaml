@@ -18,6 +18,13 @@ seed: 0  # seed for the parameter sampler RNG (not the training seed)
 metric: eval/reward_iqm
 direction: maximize  # maximize | minimize
 
+hydra:
+  run:
+    dir: logs/runs/${now:%Y-%m-%d}/${now:%H-%M-%S}
+  sweep:
+    dir: logs/multirun/${now:%Y-%m-%d}/${now:%H-%M-%S}
+    subdir: ${hydra.job.num}
+
 # Overrides applied to every trial (use to shorten runs for search)
 fixed_overrides:
   collector.total_frames: 10_000_000

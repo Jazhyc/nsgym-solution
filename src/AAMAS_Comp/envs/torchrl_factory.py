@@ -150,6 +150,8 @@ def make_ns_plr_env(
     obs_rms: RunningMeanStd | None = None,
     dtype: torch.dtype | None = None,
     stats_queue=None,
+    worker_idx: int = 0,
+    score_array=None,
 ) -> TransformedEnv:
     """Create a PLREnv-backed TorchRL TransformedEnv for NS training.
 
@@ -168,6 +170,8 @@ def make_ns_plr_env(
         staleness_coef=plr_cfg.staleness_coef,
         seed=None,  # OS entropy so each worker explores different configs
         stats_queue=stats_queue,
+        worker_idx=worker_idx,
+        score_array=score_array,
     )
     base_env = GymWrapper(NoInfoWrapper(plr_env), device=device)
     return TransformedEnv(base_env, Compose(*_make_env_transforms(base_env, obs_rms, frame_stack)))
