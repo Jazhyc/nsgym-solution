@@ -136,6 +136,38 @@ class ParamSpec:
 
 
 # ---------------------------------------------------------------------------
+# Mutation helpers (used by ACCELBuffer / NSEnvSampler.mutate)
+# ---------------------------------------------------------------------------
+
+def _perturb_kwargs(
+    kwargs: dict[str, Any],
+    ranges: dict[str, tuple],
+    rng: np.random.Generator,
+    sigma: float,
+) -> dict[str, Any]:
+    """Perturb numeric kwargs with additive Gaussian noise clipped to valid ranges.
+
+    For each kwarg present in `ranges`, applies:
+        new_val = clip(val + N(0, sigma * (hi - lo)), lo, hi)
+    Kwargs with no entry in `ranges` are passed through unchanged.
+    Integer bounds (both lo and hi are int) produce rounded integer output.
+    """
+    result = {}
+    for key, val in kwargs.items():
+        if key not in ranges:
+            result[key] = val
+            continue
+        lo, hi = ranges[key]
+        noise = rng.normal(0.0, sigma * (hi - lo))
+        new_val = float(val) + noise
+        new_val = float(np.clip(new_val, lo, hi))
+        if isinstance(lo, int) and isinstance(hi, int):
+            new_val = int(round(new_val))
+        result[key] = new_val
+    return result
+
+
+# ---------------------------------------------------------------------------
 # NSEnvSampler
 # ---------------------------------------------------------------------------
 
@@ -212,6 +244,59 @@ class NSEnvSampler:
             tunable_params=tunable_params,
             gym_kwargs=self.gym_kwargs,
             wrapper_kwargs=self.wrapper_kwargs,
+        )
+
+    def mutate(
+        self,
+        config: NSEnvConfig,
+        rng: np.random.Generator,
+        mutation_sigma: float = 0.2,
+    ) -> NSEnvConfig:
+        """Return a mutated copy of `config` by perturbing numeric kwargs.
+
+        For each scheduler/update_fn kwarg, additive Gaussian noise is applied
+        within the valid range for that kwarg (global defaults merged with any
+        per-ParamSpec overrides).  The scheduler and update_fn *classes* are not
+        changed — only their numeric arguments.
+
+        Args:
+            config:         Source config to mutate.
+            rng:            NumPy Generator (shared with PLRBuffer).
+            mutation_sigma: Noise scale as a fraction of each kwarg's range width.
+                            0.2 → std = 20% of (hi - lo).
+        """
+        spec_map = {spec.param_name: spec for spec in self.param_specs}
+        new_tunable: dict[str, ParamConfig] = {}
+
+        for param_name, param_config in config.tunable_params.items():
+            spec = spec_map.get(param_name)
+
+            sched = param_config.scheduler
+            sched_ranges: dict[str, tuple] = {**SCHEDULER_SPACE.get(sched.cls, {})}
+            if spec is not None:
+                sched_ranges.update(spec.scheduler_overrides.get(sched.cls, {}))
+
+            ufn = param_config.update_fn
+            ufn_ranges: dict[str, tuple] = {**UPDATE_FN_SPACE.get(ufn.cls, {})}
+            if spec is not None:
+                ufn_ranges.update(spec.update_fn_overrides.get(ufn.cls, {}))
+
+            new_tunable[param_name] = ParamConfig(
+                scheduler=SchedulerConfig(
+                    sched.cls,
+                    _perturb_kwargs(sched.kwargs, sched_ranges, rng, mutation_sigma),
+                ),
+                update_fn=UpdateFnConfig(
+                    ufn.cls,
+                    _perturb_kwargs(ufn.kwargs, ufn_ranges, rng, mutation_sigma),
+                ),
+            )
+
+        return NSEnvConfig(
+            env_id=config.env_id,
+            tunable_params=new_tunable,
+            gym_kwargs=config.gym_kwargs,
+            wrapper_kwargs=config.wrapper_kwargs,
         )
 
     def make(self, config: NSEnvConfig | None = None) -> gym.Env:

@@ -162,6 +162,8 @@ def make_ns_plr_env(
         sampler_key=plr_cfg.sampler_key,
         plr_capacity=plr_cfg.capacity,
         replay_prob=plr_cfg.replay_prob,
+        mutation_prob=plr_cfg.get("mutation_prob", 0.0),
+        mutation_sigma=plr_cfg.get("mutation_sigma", 0.2),
         score_temp=plr_cfg.score_temp,
         staleness_coef=plr_cfg.staleness_coef,
         seed=None,  # OS entropy so each worker explores different configs

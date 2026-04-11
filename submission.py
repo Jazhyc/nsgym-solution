@@ -26,8 +26,8 @@ def get_agent(env_id: str):
         ####################
         ## YOUR CODE HERE ##
         ####################
-        return MyModelFreeAgent("models/ppo_ant/ppo_final.pt", 
-                                  env_id=env_id, device="cuda")
+        ant_model_path = Path("models/ppo_ant/ppo_final.pt")
+        return MyModelFreeAgent(str(ant_model_path), env_id=env_id, device="cpu")
 
     elif env_id == "FrozenLake-v1":
         ####################

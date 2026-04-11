@@ -93,6 +93,11 @@ class PLREnv(gym.Env):
         sampler_key:    Key into NS_ENV_SAMPLERS ("cartpole", "ant", "frozenlake").
         plr_capacity:   Max levels in the PLR buffer.
         replay_prob:    Probability of replaying vs exploring a new config.
+        mutation_prob:  Of the explore steps, fraction that use ACCEL mutation
+                        (perturbing a high-scoring config) rather than random
+                        sampling. 0.0 = pure PLR (default).
+        mutation_sigma: Noise scale for mutation (fraction of each kwarg's range
+                        width). Default: 0.2.
         score_temp:     Softmax temperature for score-based sampling.
         staleness_coef: Weight for staleness component in sampling distribution.
         seed:           RNG seed for the PLR buffer (None → OS entropy).
@@ -103,6 +108,8 @@ class PLREnv(gym.Env):
         sampler_key: str = "cartpole",
         plr_capacity: int = 100,
         replay_prob: float = 0.5,
+        mutation_prob: float = 0.0,
+        mutation_sigma: float = 0.2,
         score_temp: float = 0.1,
         staleness_coef: float = 0.1,
         seed: int | None = None,
@@ -114,6 +121,8 @@ class PLREnv(gym.Env):
             sampler,
             capacity=plr_capacity,
             replay_prob=replay_prob,
+            mutation_prob=mutation_prob,
+            mutation_sigma=mutation_sigma,
             score_temp=score_temp,
             staleness_coef=staleness_coef,
             seed=seed,
@@ -124,6 +133,7 @@ class PLREnv(gym.Env):
         self._stats_queue = stats_queue
         self._episode_count: int = 0
         self._replay_count: int = 0
+        self._mutation_count: int = 0
 
         # Build a throwaway env to read spaces, then discard it
         _, init_config = self.plr.sample()
@@ -140,13 +150,16 @@ class PLREnv(gym.Env):
         # Sample next config and rebuild env
         self._level_id, config = self.plr.sample()
 
-        # Track replay/explore ratio and push stats to main process
+        # Track replay/mutation/explore ratios and push stats to main process
         if self.plr.last_was_replay:
             self._replay_count += 1
+        if self.plr.last_was_mutation:
+            self._mutation_count += 1
         self._episode_count += 1
         if self._stats_queue is not None:
             stats = self.plr.stats()
             stats["plr/replay_fraction"] = self._replay_count / self._episode_count
+            stats["accel/mutation_fraction"] = self._mutation_count / self._episode_count
             try:
                 self._stats_queue.put_nowait(stats)
             except Exception:

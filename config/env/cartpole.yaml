@@ -28,3 +28,6 @@ plr:
                               # Evaluated in shards of training.num_eval_episodes envs.
                               # Can be any value ≥ 1 independent of num_eval_episodes.
   eval_seed: 42               # separate seed so eval configs differ from training
+  # ── ACCEL mutation (set mutation_prob > 0 to enable) ─────────────────────
+  mutation_prob: 0.0          # fraction of explore steps that mutate a high-score config
+  mutation_sigma: 0.2         # noise scale: std = sigma * (hi - lo) per kwarg

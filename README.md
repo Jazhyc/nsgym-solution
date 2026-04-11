@@ -139,13 +139,19 @@ Logged metrics include `train/reward_mean`, `train/kl_approx`, `train/clip_fract
 
 ## Checkpoints
 
-Checkpoints are saved to `checkpoints/` at the interval set by `training.save_interval` (default: every 10 000 collector iterations) and as `checkpoints/ppo_final.pt` at the end of training.
+Ant training writes checkpoints to `checkpoints/` by default. When you have a run you trust, promote the final artifact into the tracked model slot with a manual copy, for example:
+
+```bash
+cp checkpoints/ppo_final.pt models/ppo_ant/ppo_final.pt
+```
+
+That tracked checkpoint includes the observation running statistics, so no separate normalizer file is needed.
 
 Load a saved model:
 
 ```python
 from AAMAS_Comp.agents.ppo import PPOAgent
 
-agent = PPOAgent.load("checkpoints/ppo_final.pt", device="cpu")
+agent = PPOAgent.load("models/ppo_ant/ppo_final.pt", device="cpu")
 action = agent.get_action({"state": obs})
 ```
