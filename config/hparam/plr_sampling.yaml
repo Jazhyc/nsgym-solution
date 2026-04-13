@@ -6,7 +6,7 @@
 #   python scripts/hparam_search.py config/hparam/plr_sampling.yaml
 
 env: ant
-n_trials: 20
+n_trials: 30
 seed: 1
 metric: eval/reward_iqm
 direction: maximize
@@ -21,7 +21,7 @@ hydra:
 fixed_overrides:
   collector.total_frames: 10_000_000
   training.eval_ratio: 0.2
-  env.plr.score_temp: 0.5  # fixed at tuned value from temperature search
+  env.plr.score_temp: 0.8  # fixed at tuned value from temperature search
   hydra.run.dir: logs/hparam/plr_sampling_search
 
 wandb:
