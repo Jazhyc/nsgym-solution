@@ -51,12 +51,19 @@ def profile_agent_step(agent, obs, env):
     _, timings["normalise"] = _time(agent._normalise, flat_obs)
     s = agent._normalise(flat_obs)
 
-    # --- raw net forward (new fast path) ---
-    obs_t = s.unsqueeze(0)
-    t0 = time.perf_counter()
-    with torch.no_grad():
-        _ = agent._raw_net(obs_t)
-    timings["raw_net_forward"] = time.perf_counter() - t0
+    # --- net forward: ORT session if active, else raw nn.Sequential ---
+    obs_np = s.unsqueeze(0).numpy()
+    if getattr(agent, "_ort_session", None) is not None:
+        in_name = agent._ort_session.get_inputs()[0].name
+        t0 = time.perf_counter()
+        agent._ort_session.run(None, {in_name: obs_np})
+        timings["raw_net_forward"] = time.perf_counter() - t0
+    else:
+        obs_t = s.unsqueeze(0)
+        t0 = time.perf_counter()
+        with torch.no_grad():
+            _ = agent._raw_net(obs_t)
+        timings["raw_net_forward"] = time.perf_counter() - t0
 
     # --- full _sample_action (includes raw_net + sample overhead) ---
     _, timings["sample_action"] = _time(agent._sample_action, s)
