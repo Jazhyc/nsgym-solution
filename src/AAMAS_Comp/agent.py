@@ -1,8 +1,6 @@
 from __future__ import annotations
 from typing import Dict, Optional
 
-import io
-import logging
 import warnings
 import numpy as np
 import torch
@@ -185,11 +183,10 @@ class MyModelFreeAgent(ModelFreeAgent):
         # module[0] is the TensorDictModule wrapping the raw nn.Sequential.
         self._raw_net = self._actor.module[0].module
         self._is_discrete = (env_id in _DISCRETE_ENVS)
-        self._raw_mlp = None  # JIT-compiled inner MLP for continuous envs (fallback)
-        self._raw_npe = None  # NormalParamExtractor (not scriptable, fallback)
-        self._ort_session = None  # ONNX Runtime session (preferred)
-        self._npe_bias    = None  # biased_softplus bias for continuous envs
-        self._npe_min_val = None  # biased_softplus min_val for continuous envs
+        self._raw_mlp = None
+        self._raw_npe = None
+        self._npe_bias    = None
+        self._npe_min_val = None
 
         if not self._is_discrete:
             try:
@@ -200,21 +197,11 @@ class MyModelFreeAgent(ModelFreeAgent):
                 self._action_low  = None
                 self._action_high = None
 
-        obs_dim = self._raw_net[0][0].in_features
-
         # ── Fast inference path selection (fastest → slowest) ────────────────
-        # 1. Numpy matmul: extract weights once; pure numpy x@W+b per step.
-        #    Works for any Linear+activation net; avoids all Python→C++ dispatch.
-        # 2. ONNX Runtime: fallback for non-standard layers.
-        # 3. JIT: fallback if ONNX unavailable.
-        # 4. Raw nn.Sequential: last resort.
-        self._np_layers   = None
-        self._ort_session = None
-        self._npe_bias    = None
-        self._npe_min_val = None
-        self._raw_mlp     = None
-        self._raw_npe     = None
-
+        # 1. Numpy matmul: weights extracted once; pure x@W+b per step, no dispatch.
+        # 2. JIT: fallback for unsupported layer types (e.g. LayerNorm).
+        # 3. Raw nn.Sequential: last resort.
+        self._np_layers = None
         try:
             self._np_layers = _extract_np_layers(self._raw_net[0])
             if not self._is_discrete:
@@ -222,51 +209,19 @@ class MyModelFreeAgent(ModelFreeAgent):
                 self._npe_bias    = float(bs.bias)
                 self._npe_min_val = float(bs.min_val)
         except Exception:
-            # Fall back to ONNX Runtime
-            try:
-                import onnxruntime as ort
-                export_net = self._raw_net if self._is_discrete else self._raw_net[0]
-                out_names  = ['logits'] if self._is_discrete else ['raw']
-                buf = io.BytesIO()
-                _onnx_log = logging.getLogger("torch.onnx")
-                _prev_level = _onnx_log.level
-                _onnx_log.setLevel(logging.ERROR)
+            if self._is_discrete:
                 try:
-                    with torch.no_grad(), warnings.catch_warnings():
-                        warnings.simplefilter("ignore")
-                        torch.onnx.export(
-                            export_net, torch.zeros(1, obs_dim), buf,
-                            input_names=['obs'], output_names=out_names,
-                            dynamic_axes=None, opset_version=18,
-                        )
-                finally:
-                    _onnx_log.setLevel(_prev_level)
-                buf.seek(0)
-                opts = ort.SessionOptions()
-                opts.intra_op_num_threads = 1
-                self._ort_session = ort.InferenceSession(
-                    buf.read(), sess_options=opts,
-                    providers=['CPUExecutionProvider'],
-                )
-                if not self._is_discrete:
-                    bs = self._raw_net[1].scale_mapping
-                    self._npe_bias    = float(bs.bias)
-                    self._npe_min_val = float(bs.min_val)
-            except Exception:
-                # Fall back to JIT
-                if self._is_discrete:
-                    try:
-                        self._raw_net = torch.jit.optimize_for_inference(
-                            torch.jit.script(self._raw_net))
-                    except Exception:
-                        pass
-                else:
-                    try:
-                        self._raw_mlp = torch.jit.optimize_for_inference(
-                            torch.jit.script(self._raw_net[0]))
-                        self._raw_npe = self._raw_net[1]
-                    except Exception:
-                        pass
+                    self._raw_net = torch.jit.optimize_for_inference(
+                        torch.jit.script(self._raw_net))
+                except Exception:
+                    pass
+            else:
+                try:
+                    self._raw_mlp = torch.jit.optimize_for_inference(
+                        torch.jit.script(self._raw_net[0]))
+                    self._raw_npe = self._raw_net[1]
+                except Exception:
+                    pass
 
         # ── Obs normalisation ────────────────────────────────────────────────
         obs_rms = ckpt.get("obs_rms", None)
@@ -529,32 +484,6 @@ class MyModelFreeAgent(ModelFreeAgent):
                 action = np.tanh(loc)
             else:
                 action = np.tanh(loc + scale * np.random.standard_normal(loc.shape).astype(np.float32))
-            if self._action_low is not None:
-                lo = self._action_low.numpy()
-                hi = self._action_high.numpy()
-                action = lo + (action + 1.0) * 0.5 * (hi - lo)
-            return action
-
-        obs_np = s.unsqueeze(0).numpy()  # zero-copy view for CPU tensors
-
-        if self._ort_session is not None:
-            ort_out = self._ort_session.run(None, {'obs': obs_np})
-            if self._is_discrete:
-                logits = ort_out[0][0]  # (n_actions,) numpy
-                if self.deterministic:
-                    return int(logits.argmax())
-                noise = np.random.exponential(size=logits.shape).astype(np.float32)
-                return int((logits - np.log(noise)).argmax())
-            # Continuous: ONNX gives raw MLP output; apply biased_softplus split
-            raw    = ort_out[0][0]           # (2 * act_dim,)
-            act_dim = raw.shape[0] // 2
-            loc   = raw[:act_dim]
-            scale = np.logaddexp(0.0, raw[act_dim:] + self._npe_bias) + self._npe_min_val
-            if self.deterministic:
-                action = np.tanh(loc)
-            else:
-                action = np.tanh(loc + scale * np.random.standard_normal(loc.shape).astype(np.float32))
-            # Scale to action bounds (no-op when bounds are [-1, 1])
             if self._action_low is not None:
                 lo = self._action_low.numpy()
                 hi = self._action_high.numpy()
