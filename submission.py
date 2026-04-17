@@ -10,7 +10,7 @@ from AAMAS_Comp.agent import MyModelBasedAgent, ModelFreeAgent, MyModelFreeAgent
 import gymnasium as gym
 
 
-def get_agent(env_id: str, notify: str = "notify-none"):
+def get_agent(env_id: str, notify: str = "notify-none"):  # noqa: ARG001
     """Return an agent instance configured for the given environment.
 
     Args:
@@ -30,13 +30,7 @@ def get_agent(env_id: str, notify: str = "notify-none"):
         return MyModelFreeAgent(str(ant_model_path), env_id=env_id, device="cpu", online_learning=False)
 
     elif env_id == "FrozenLake-v1":
-        # notify-full: use a model trained with transition_prob as context
-        # feature (obs dim 19 = 16 one-hot + 3 prob values).
-        # notify-change / notify-none: use the standard model (obs dim 16).
-        if notify == "notify-full":
-            model_path = "models/ppo_frozenlake/ppo_final_full_notify.pt"
-        else:
-            model_path = "models/ppo_frozenlake/ppo_final_no_notify.pt"
+        model_path = "models/ppo_frozenlake/ppo_final_no_notify.pt"
         return MyModelFreeAgent(model_path, env_id=env_id, device="cpu", online_learning=False)
 
     elif env_id == "CartPole-v1":

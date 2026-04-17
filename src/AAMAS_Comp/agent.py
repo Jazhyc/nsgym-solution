@@ -82,6 +82,8 @@ def compute_reward_frozenlake(obs_state, grid_size=4):
                else int(obs_state)
     return 1.0 if position == grid_size * grid_size - 1 else 0.0
 
+_DISCRETE_ENVS = {"FrozenLake-v1", "CartPole-v1"}
+
 REWARD_FNS = {
     "Ant-v5":        compute_reward_ant,
     "CartPole-v1":   compute_reward_cartpole,
@@ -183,6 +185,17 @@ class MyModelFreeAgent(ModelFreeAgent):
         self._ctx_keys: list[str]       = _ctx.get("context_keys", [])
         self._ctx_defaults: dict        = _ctx.get("context_defaults", {})
         self._n_state: int | None       = _ctx.get("n_state", None)
+        # Fallback for old checkpoints without context_meta: infer obs dim from
+        # the actor's first Linear layer so _prepare_obs can still one-hot encode.
+        if self._n_state is None and self.env_id in _DISCRETE_ENVS:
+            try:
+                first_linear = next(
+                    m for m in self._actor.modules()
+                    if isinstance(m, torch.nn.Linear)
+                )
+                self._n_state = first_linear.in_features
+            except StopIteration:
+                pass
         # Current context cache — updated via update_context(info) in evaluator
         self._last_context: dict[str, np.ndarray] = {
             k: np.array(self._ctx_defaults.get(k, [0.0]), dtype=np.float32)
@@ -379,7 +392,10 @@ class MyModelFreeAgent(ModelFreeAgent):
                 else ExplorationType.RANDOM
         with set_exploration_type(explore), torch.no_grad():
             td = self._actor(td)
-        return td["action"].squeeze(0).cpu().numpy()
+        action = td["action"].squeeze(0).cpu().numpy()
+        if self.env_id in _DISCRETE_ENVS:
+            return int(action.argmax())
+        return action
 
     def set_seed(self, seed: int):
         torch.manual_seed(seed)
