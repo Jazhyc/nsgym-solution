@@ -17,8 +17,8 @@ from AAMAS_Comp.base_agent import ModelFreeAgent, ModelBasedAgent
 
 # ── Numpy MLP forward-pass helper ─────────────────────────────────────────────
 _NP_ACTS = {
-    torch.nn.Tanh: np.tanh,
-    torch.nn.ReLU: lambda x: np.maximum(x, 0),
+    torch.nn.Tanh: np.tanh,                              # accepts out= natively
+    torch.nn.ReLU: lambda x, out=None: np.maximum(x, 0, out=out),
 }
 
 def _extract_np_layers(seq):
@@ -202,9 +202,21 @@ class MyModelFreeAgent(ModelFreeAgent):
         # 2. JIT: fallback for unsupported layer types (e.g. LayerNorm).
         # 3. Raw nn.Sequential: last resort.
         self._np_layers = None
+        self._np_bufs   = None
+        self._rng       = None
+        self._gumbel_buf       = None
+        self._action_noise_buf = None
         try:
             self._np_layers = _extract_np_layers(self._raw_net[0])
-            if not self._is_discrete:
+            # One pre-allocated output buffer per layer — eliminates all intermediate allocations.
+            self._np_bufs = [np.empty(b.shape[0], dtype=np.float32) for _, b, _ in self._np_layers]
+            self._rng = np.random.default_rng()
+            if self._is_discrete:
+                n_actions = self._np_layers[-1][1].shape[0]
+                self._gumbel_buf = np.empty(n_actions, dtype=np.float32)
+            else:
+                act_dim = self._np_layers[-1][1].shape[0] // 2
+                self._action_noise_buf = np.empty(act_dim, dtype=np.float32)
                 bs = self._raw_net[1].scale_mapping
                 self._npe_bias    = float(bs.bias)
                 self._npe_min_val = float(bs.min_val)
@@ -467,23 +479,33 @@ class MyModelFreeAgent(ModelFreeAgent):
 
     def _sample_action(self, s: torch.Tensor) -> np.ndarray:
         if self._np_layers is not None:
-            x = s.numpy()  # (obs_dim,) — zero-copy view, safe because _normalise always copies
-            for W, b, act in self._np_layers:
-                x = x @ W + b
+            x = s.numpy()  # (obs_dim,) — zero-copy, safe because _normalise always copies
+            for (W, b, act), buf in zip(self._np_layers, self._np_bufs):
+                np.dot(x, W, out=buf)
+                buf += b
                 if act is not None:
-                    x = act(x)
+                    act(buf, out=buf)
+                x = buf
+            # x is now self._np_bufs[-1]: logits (discrete) or raw (continuous)
             if self._is_discrete:
                 if self.deterministic:
                     return int(x.argmax())
-                noise = np.random.exponential(size=x.shape).astype(np.float32)
-                return int((x - np.log(noise)).argmax())
+                # Gumbel-max: argmax(logits - log(Exp(1))), all in pre-allocated buffer
+                self._rng.standard_exponential(out=self._gumbel_buf, dtype=np.float32)
+                np.log(self._gumbel_buf, out=self._gumbel_buf)
+                np.subtract(x, self._gumbel_buf, out=self._gumbel_buf)
+                return int(self._gumbel_buf.argmax())
             act_dim = x.shape[0] // 2
             loc   = x[:act_dim]
             scale = np.logaddexp(0.0, x[act_dim:] + self._npe_bias) + self._npe_min_val
             if self.deterministic:
                 action = np.tanh(loc)
             else:
-                action = np.tanh(loc + scale * np.random.standard_normal(loc.shape).astype(np.float32))
+                self._rng.standard_normal(out=self._action_noise_buf, dtype=np.float32)
+                self._action_noise_buf *= scale
+                self._action_noise_buf += loc
+                np.tanh(self._action_noise_buf, out=self._action_noise_buf)
+                action = self._action_noise_buf
             if self._action_low is not None:
                 lo = self._action_low.numpy()
                 hi = self._action_high.numpy()
