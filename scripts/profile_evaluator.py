@@ -51,9 +51,17 @@ def profile_agent_step(agent, obs, env):
     _, timings["normalise"] = _time(agent._normalise, flat_obs)
     s = agent._normalise(flat_obs)
 
-    # --- net forward: ORT session if active, else raw nn.Sequential ---
-    obs_np = s.unsqueeze(0).numpy()
-    if getattr(agent, "_ort_session", None) is not None:
+    # --- net forward: measure whichever backend _sample_action will use ---
+    if getattr(agent, "_np_layers", None) is not None:
+        x = s.numpy()
+        t0 = time.perf_counter()
+        for W, b, act in agent._np_layers:
+            x = x @ W + b
+            if act is not None:
+                x = act(x)
+        timings["raw_net_forward"] = time.perf_counter() - t0
+    elif getattr(agent, "_ort_session", None) is not None:
+        obs_np = s.unsqueeze(0).numpy()
         in_name = agent._ort_session.get_inputs()[0].name
         t0 = time.perf_counter()
         agent._ort_session.run(None, {in_name: obs_np})
