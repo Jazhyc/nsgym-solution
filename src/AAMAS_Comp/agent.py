@@ -152,7 +152,15 @@ class MyModelFreeAgent(ModelFreeAgent):
         # module[0] is the TensorDictModule wrapping the raw nn.Sequential.
         self._raw_net = self._actor.module[0].module
         self._is_discrete = (env_id in _DISCRETE_ENVS)
-        if not self._is_discrete:
+        self._raw_mlp = None  # JIT-compiled inner MLP for continuous envs
+        self._raw_npe = None  # NormalParamExtractor (not scriptable)
+        if self._is_discrete:
+            try:
+                self._raw_net = torch.jit.optimize_for_inference(
+                    torch.jit.script(self._raw_net))
+            except Exception:
+                pass
+        else:
             try:
                 dkw = self._actor.module[1].distribution_kwargs
                 self._action_low  = dkw["low"].to(self.device)
@@ -160,6 +168,14 @@ class MyModelFreeAgent(ModelFreeAgent):
             except Exception:
                 self._action_low  = None
                 self._action_high = None
+            # NormalParamExtractor uses *args so it can't be scripted;
+            # script only the inner MLP (net[0]) and keep NPE separate.
+            try:
+                self._raw_mlp = torch.jit.optimize_for_inference(
+                    torch.jit.script(self._raw_net[0]))
+                self._raw_npe = self._raw_net[1]
+            except Exception:
+                pass
 
         # ── Obs normalisation ────────────────────────────────────────────────
         obs_rms = ckpt.get("obs_rms", None)
@@ -402,7 +418,10 @@ class MyModelFreeAgent(ModelFreeAgent):
     def _sample_action(self, s: torch.Tensor) -> np.ndarray:
         obs = s.unsqueeze(0)
         with torch.no_grad():
-            net_out = self._raw_net(obs)
+            if self._raw_mlp is not None:
+                net_out = self._raw_npe(self._raw_mlp(obs))
+            else:
+                net_out = self._raw_net(obs)
 
         if self._is_discrete:
             logits = net_out.squeeze(0)
