@@ -14,8 +14,8 @@ from submission import get_agent
 
 #Add additional envionments here or comment out the ones you do not want to evaluate. 
 ENVIRONMENTS = {
-    # "ExampleNSFrozenLake-v0": "FrozenLake-v1",
-    # "ExampleNSCartPole-v0": "CartPole-v1",
+    "ExampleNSFrozenLake-v0": "FrozenLake-v1",
+    "ExampleNSCartPole-v0": "CartPole-v1",
     "ExampleNSAnt-v0": "Ant-v5",
 }
 

@@ -26,16 +26,10 @@ def get_agent(env_id: str, notify: str = "notify-none"):
         Agent: Your initialized agent object.
     """
     if env_id == "Ant-v5":
-        ####################
-        ## YOUR CODE HERE ##
-        ####################
         ant_model_path = Path("models/ppo_ant/ppo_final.pt")
-        return MyModelFreeAgent(str(ant_model_path), env_id=env_id, device="cpu")
+        return MyModelFreeAgent(str(ant_model_path), env_id=env_id, device="cpu", online_learning=False)
 
     elif env_id == "FrozenLake-v1":
-        ####################
-        ## YOUR CODE HERE ##
-        ####################
         # notify-full: use a model trained with transition_prob as context
         # feature (obs dim 19 = 16 one-hot + 3 prob values).
         # notify-change / notify-none: use the standard model (obs dim 16).
@@ -43,13 +37,10 @@ def get_agent(env_id: str, notify: str = "notify-none"):
             model_path = "models/ppo_frozenlake/ppo_final_full_notify.pt"
         else:
             model_path = "models/ppo_frozenlake/ppo_final_no_notify.pt"
-        return MyModelFreeAgent(model_path, env_id=env_id, device="cpu")
+        return MyModelFreeAgent(model_path, env_id=env_id, device="cpu", online_learning=False)
 
     elif env_id == "CartPole-v1":
-        ####################
-        ## YOUR CODE HERE ##
-        ####################
-        return MyModelFreeAgent("models/ppo_cartpole/ppo_final.pt", env_id=env_id, device="cpu")
+        return MyModelFreeAgent("models/ppo_cartpole/ppo_final.pt", env_id=env_id, device="cpu", online_learning=False)
 
     else:
         raise ValueError(f"{env_id} not in: Ant-v5, FrozenLake-v1, CartPole-v1")
