@@ -180,11 +180,15 @@ class MyModelFreeAgent(ModelFreeAgent):
         # ── Obs normalisation ────────────────────────────────────────────────
         obs_rms = ckpt.get("obs_rms", None)
         if obs_rms is not None:
-            self._obs_mean = obs_rms["mean"].to(self.device).float()
-            self._obs_std  = obs_rms["std"].to(self.device).float()
+            self._obs_mean    = obs_rms["mean"].to(self.device).float()
+            self._obs_std     = obs_rms["std"].to(self.device).float()
+            self._obs_std_eps = self._obs_std + 1e-8   # pre-computed, avoids per-step kernel
+            self._has_obs_norm = True
         else:
-            self._obs_mean = None
-            self._obs_std  = None
+            self._obs_mean     = None
+            self._obs_std      = None
+            self._obs_std_eps  = None
+            self._has_obs_norm = False
 
         # ── EWC: freeze θ* and Fisher ────────────────────────────────────────
         if self.use_ewc:
@@ -268,8 +272,8 @@ class MyModelFreeAgent(ModelFreeAgent):
 
     def _normalise(self, state: np.ndarray) -> torch.Tensor:
         s = torch.as_tensor(state, dtype=torch.float32, device=self.device)
-        if self._obs_mean is not None and self._obs_mean.shape == s.shape:
-            s = (s - self._obs_mean) / (self._obs_std + 1e-8)
+        if self._has_obs_norm:
+            s = s.sub_(self._obs_mean).div_(self._obs_std_eps)
         return s
 
     def _compute_reward(self, state, prev_state, action):
