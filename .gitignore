@@ -198,6 +198,9 @@ cython_debug/
 #  Cursor is an AI-powered code editor. `.cursorignore` specifies files/directories to
 #  exclude from AI features like autocomplete and code analysis. Recommended for sensitive data
 #  refer to https://docs.cursor.com/context/ignore-files
+
+# Ant PPO training exports keep the final tracked model in models/ppo_ant/.
+models/ppo_ant/ppo_iter_*.pt
 .cursorignore
 .cursorindexingignore
 
@@ -211,7 +214,8 @@ __marimo__/
 
 results/
 logs/
-checkpoints/
+checkpoints/*/*.pt
 !config/env
-
-
+!models/
+.vscode
+.serena/

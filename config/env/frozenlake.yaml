@@ -5,5 +5,38 @@ frame_skip: 1
 # FrozenLake has a discrete integer observation (0–15 for the 4×4 grid).
 # The training script detects this and applies one-hot encoding automatically.
 # Set normalize_obs: false — normalizing integer states is meaningless.
+frame_stack: 1                  # number of consecutive frames to stack along obs dim (1 = disabled)
 normalize_obs: false
 normalize_reward: false   # Rewards are binary (0 or 1); no scaling needed
+
+# ── Context features (appended to obs for notify-full training) ──────────
+# Keys must match fields in info dict returned by step(). For FrozenLake,
+# "transition_prob" is the current [p_straight, p_left, p_right] distribution.
+# Set context_features to [] to train without context (standard notify-none baseline).
+context_features: [transition_prob]
+context_defaults:
+  transition_prob: [0.3333, 0.3333, 0.3334]   # matches initial_prob_dist [1/3, 1/3, 1/3]
+
+# ── NS training mode ─────────────────────────────────────────────────────
+# ns_baseline: true  → random NS config per episode, no PLR curriculum.
+#                      Eval uses same held-out NS configs as PLR (plr block below).
+# ns_baseline: false → ignored if plr.enabled=true; uses stationary env otherwise.
+ns_baseline: false
+
+# ── Prioritized Level Replay (PLR) ───────────────────────────────────────
+# Set enabled: true to rotate NS configs during training via PLR.
+# Eval always uses a fixed held-out set (eval_seed) regardless of this flag.
+plr:
+  enabled: true
+  sampler_key: frozenlake    # key into NS_ENV_SAMPLERS
+  capacity: 50               # smaller buffer — FrozenLake param space is narrower
+  replay_prob: 0.5           # P(replay existing level) once buffer is warm
+  score_temp: 0.1            # softmax temperature (lower → greedier replay)
+  staleness_coef: 0.1        # weight for staleness in sampling distribution
+  num_eval_configs: 24       # distinct held-out configs for evaluation
+                             # Evaluated in shards of training.num_eval_episodes envs.
+                             # Can be any value ≥ 1 independent of num_eval_episodes.
+  eval_seed: 42              # separate seed so eval configs differ from training
+  # ── ACCEL mutation (set mutation_prob > 0 to enable) ────────────────────
+  mutation_prob: 0.25         # fraction of explore steps that mutate a high-score config
+  mutation_sigma: 0.2        # noise scale: std = sigma * (hi - lo) per kwarg

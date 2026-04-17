@@ -22,77 +22,46 @@ import os
 import warnings
 from pathlib import Path
 
+# Suppress FutureWarnings from torchrl (Python 3.13 compatibility issues)
+# Must be registered before any torchrl import, as the warnings fire at module load time.
+warnings.filterwarnings("ignore", category=FutureWarning, module="torchrl.modules.mcts.scores")
+
+import multiprocessing as mp
+from functools import partial
+
 import hydra
 import torch
+import torch._dynamo
 from omegaconf import DictConfig, OmegaConf
 from tqdm import tqdm
 
+from AAMAS_Comp.agent import compute_and_save_fisher
+
+# EnvBase.__del__ calls set_num_threads() to restore subprocess state.  If
+# this fires while dynamo is recompiling (e.g. async collector background
+# thread), the guard-check assertion fails inside __del__ and Python prints
+# "Exception ignored in: EnvBase.__del__".  Training is unaffected (it falls
+# back to eager), but the noise is confusing.  suppress_errors makes dynamo
+# fall back silently instead of propagating the AssertionError.
+torch._dynamo.config.suppress_errors = True
+
 import wandb
 
-# Suppress FutureWarnings from torchrl (Python 3.13 compatibility issues)
-warnings.filterwarnings("ignore", category=FutureWarning, module="torchrl.modules.mcts.scores")
+from AAMAS_Comp.optimizers.cbp import ContinualBackpropagation
 
-# TorchRL imports
 from torchrl.collectors import MultiAsyncCollector
-from torchrl.data import OneHot, UnboundedContinuous
-from torchrl.envs import (
-    Compose,
-    DoubleToFloat,
-    ObservationNorm,
-    ParallelEnv,
-    StepCounter,
-    TransformedEnv,
-)
-from torchrl.envs.transforms import Transform
-import gymnasium as gym
-from gymnasium import Wrapper as GymnasiumWrapper
+from torchrl.envs import ParallelEnv
 
-from torchrl.envs.libs.gym import GymEnv, GymWrapper
-
-
-class DiscreteObsToFloat(Transform):
-    """Cast a one-hot discrete observation from int64 to float32.
-
-    TorchRL's GymWrapper already converts gym.spaces.Discrete observations to
-    one-hot integer tensors of shape (n,).  This transform casts them to
-    float32 so they can be fed directly into an MLP.
-    """
-
-    def __init__(self):
-        super().__init__(in_keys=["observation"], out_keys=["observation"])
-
-    def _apply_transform(self, obs: torch.Tensor) -> torch.Tensor:
-        return obs.float()
-
-    def _reset(self, tensordict, tensordict_reset):
-        # Base Transform._reset does NOT call _apply_transform; call it explicitly.
-        return self._call(tensordict_reset)
-
-    def transform_observation_spec(self, observation_spec):
-        spec = observation_spec["observation"]
-        observation_spec["observation"] = UnboundedContinuous(
-            shape=spec.shape,
-            dtype=torch.float32,
-        )
-        return observation_spec
-
-
-class NoInfoWrapper(GymnasiumWrapper):
-    """Drop the info dict from step/reset — prevents unused keys (Ant reward
-    components, position/velocity diagnostics) from being serialized over IPC
-    on every environment step."""
-
-    def step(self, action):
-        obs, reward, terminated, truncated, _info = self.env.step(action)
-        return obs, reward, terminated, truncated, {}
-
-    def reset(self, **kwargs):
-        obs, _info = self.env.reset(**kwargs)
-        return obs, {}
-from torchrl.envs.utils import ExplorationType, set_exploration_type, step_mdp
-
-# Project imports
 from AAMAS_Comp.agents.ppo import PPOAgent, make_ppo_models, RPOTanhNormal
+from AAMAS_Comp.envs.wrappers import RunningMeanStd, RewardNormalizer
+from AAMAS_Comp.envs.torchrl_factory import (
+    initialize_obs_norm,
+    make_single_env,
+    make_ns_plr_env,
+    make_ns_random_env,
+    make_ns_eval_shards,
+)
+from AAMAS_Comp.evaluation.utils import run_eval_shards
 
 log = logging.getLogger(__name__)
 
@@ -101,187 +70,21 @@ load_dotenv()
 
 
 # ---------------------------------------------------------------------------
-# Running observation normalization
+# Main training function
 # ---------------------------------------------------------------------------
 
-class RunningMeanStd:
-    """Welford online running mean / variance tracker.
-
-    Tracks the sufficient statistics (mean, var, count) so that
-    ``ObservationNorm`` transforms can be kept up-to-date as training
-    progresses.
-    """
-
-    def __init__(self, shape: tuple[int, ...] = (), device: torch.device | None = None):
-        # Use float64 for better numerical stability in running statistics
-        self.mean = torch.zeros(shape, device=device, dtype=torch.float64)
-        self.var = torch.ones(shape, device=device, dtype=torch.float64)
-        self.count: float = 0  # actual number of samples seen
-
-    def update(self, batch: torch.Tensor) -> None:
-        """Update stats with a new batch of observations ``(N, *shape)``."""
-        batch = batch.reshape(-1, *self.mean.shape)
-        # Compute batch stats in float64 for numerical stability
-        batch_f64 = batch.double()
-        batch_mean = batch_f64.mean(dim=0)
-        batch_var = batch_f64.var(dim=0, correction=0)
-        batch_count = batch.shape[0]
-        self._update_from_moments(batch_mean, batch_var, batch_count)
-
-    def _update_from_moments(self, batch_mean: torch.Tensor, batch_var: torch.Tensor, batch_count: int) -> None:
-        delta = batch_mean - self.mean
-        total_count = self.count + batch_count
-        new_mean = self.mean + delta * batch_count / total_count
-        m_a = self.var * self.count
-        m_b = batch_var * batch_count
-        m2 = m_a + m_b + delta.pow(2) * self.count * batch_count / total_count
-        self.mean = new_mean
-        self.var = m2 / total_count
-        self.count = total_count
-
-    @property
-    def std(self) -> torch.Tensor:
-        # Clamp variance before sqrt for stability, use higher minimum for safety
-        return torch.sqrt(self.var.clamp(min=1e-8)).clamp(min=1e-4)
-
-    def state_dict(self) -> dict:
-        return {"mean": self.mean.clone(), "var": self.var.clone(), "count": self.count}
-
-    def load_state_dict(self, d: dict) -> None:
-        self.mean = d["mean"]
-        self.var = d["var"]
-        self.count = d["count"]
-
-
-class RewardNormalizer:
-    """VecNormalize-style reward scaling.
-    
-    Tracks running variance of rewards and divides by sqrt(var) to bring
-    reward magnitudes to ~O(1).  Does NOT subtract the mean.
-    
-    Uses epsilon-initialized count (like SB3) so the initial std = 1.0
-    (identity scaling) and statistics build up gradually.
-    """
-    def __init__(self, device: torch.device | None = None):
-        self.reward_rms = RunningMeanStd(shape=(), device=device)
-        # Initialize with epsilon count so initial std = sqrt(1.0) = 1.0
-        self.reward_rms.count = 1e-4
-    
-    def normalize_batch(self, tensordict_data) -> None:
-        """Update stats and normalize rewards in a collected batch in-place."""
-        rewards = tensordict_data["next", "reward"]
-        # Update running stats with raw rewards (vectorized, no Python loop)
-        self.reward_rms.update(rewards)
-        # Scale rewards by 1/std (no mean subtraction)
-        std = self.reward_rms.std.to(rewards.dtype)
-        tensordict_data["next", "reward"].copy_(rewards / std)
-
-
-def initialize_obs_norm(cfg: DictConfig, device: torch.device, 
-                        dtype: torch.dtype | None = None) -> RunningMeanStd | None:
-    """Bootstrap observation normalization statistics from initial random rollout.
-    
-    Returns:
-        RunningMeanStd with bootstrap stats, or None if not enabled.
-    """
-    if not cfg.env.normalize_obs:
-        return None
-    
-    log.info("Bootstrapping observation normalization stats...")
-    # Use a plain env (no normalization) to collect raw observations
-    base_env = GymWrapper(NoInfoWrapper(gym.make(cfg.env.id)), device=device)
-    tmp = TransformedEnv(base_env, Compose(DoubleToFloat(), StepCounter()))
-    tmp.reset()
-    td = tmp.rollout(max_steps=cfg.env.normalize_obs_init_steps, break_when_any_done=False)
-    all_obs = td["observation"]
-    
-    obs_dim = tmp.observation_spec["observation"].shape[-1]
-    obs_rms = RunningMeanStd(shape=(obs_dim,), device=device)
-    obs_rms.count = 1e-4  # SB3-style epsilon init so initial std=1
-    obs_rms.update(all_obs)
-    tmp.close()
-    
-    log.info("Observation normalization bootstrapped (mean=%.3f, std=%.3f)",
-             obs_rms.mean.mean().item(), obs_rms.std.mean().item())
-    
-    return obs_rms
-
-
-# ---------------------------------------------------------------------------
-# Environment factory
-# ---------------------------------------------------------------------------
-
-def make_single_env(cfg: DictConfig, device: torch.device, obs_rms: RunningMeanStd | None = None, dtype: torch.dtype | None = None) -> TransformedEnv:
-    """Create a single TorchRL ``TransformedEnv`` instance.
-
-    Args:
-        cfg: Hydra config.
-        device: Device for the environment.
-        obs_rms: Optional RunningMeanStd with frozen stats for ObservationNorm.
-        dtype: Optional dtype to cast observations to.
-    """
-    # NoInfoWrapper drops Ant's reward components + position/velocity diagnostics
-    # from the TensorDict — they're serialized over IPC every step but never used.
-    base_env = GymWrapper(NoInfoWrapper(gym.make(cfg.env.id)), device=device)
-
-    transforms = []
-    obs_spec = base_env.observation_spec["observation"]
-    # TorchRL wraps gym.spaces.Discrete as OneHot(n) with int64 dtype.
-    # Cast to float32 so the MLP can consume it directly.
-    is_discrete_obs = isinstance(obs_spec, OneHot)
-
-    if is_discrete_obs:
-        transforms.append(DiscreteObsToFloat())
-    elif obs_rms is not None:
-        obs_norm = ObservationNorm(in_keys=["observation"], standard_normal=True)
-        # Materialise lazy buffers with frozen stats from bootstrap
-        obs_norm.loc = torch.nn.Parameter(obs_rms.mean.float().clone(), requires_grad=False)
-        obs_norm.scale = torch.nn.Parameter(obs_rms.std.float().clone(), requires_grad=False)
-        transforms.append(obs_norm)
-    transforms.append(DoubleToFloat())
-    transforms.append(StepCounter())
-
-    env = TransformedEnv(base_env, Compose(*transforms))
-    return env
-
-
-def make_parallel_env(cfg: DictConfig, device: torch.device, num_envs: int = 1, dtype: torch.dtype | None = None, obs_rms: RunningMeanStd | None = None) -> TransformedEnv | ParallelEnv:
-    """Create vectorized parallel environments."""
-    from functools import partial
-    
-    if num_envs == 1:
-        env = make_single_env(cfg, device, obs_rms=obs_rms, dtype=dtype)
-    else:
-        env = ParallelEnv(
-            num_workers=num_envs,
-            create_env_fn=partial(make_single_env, cfg, device, obs_rms, dtype),
-            serial_for_single=True,
-        )
-    
-    return env
-
-
-# ---------------------------------------------------------------------------
-# Resolve device helper
-# ---------------------------------------------------------------------------
-
-def resolve_device(device_str: str) -> torch.device:
+def _resolve_device(device_str: str) -> torch.device:
     if device_str == "auto":
         return torch.device("cuda" if torch.cuda.is_available() else "cpu")
     return torch.device(device_str)
 
 
-# ---------------------------------------------------------------------------
-# Main training function
-# ---------------------------------------------------------------------------
-
 @hydra.main(version_base=None, config_path="../config", config_name="config_ant")
 def train(cfg: DictConfig) -> None:
     # ── Resolve device & seed ──────────────────────────────────────────
-    device = resolve_device(cfg.device)
-    # Network device defaults to same as device if set to "auto"
+    device = _resolve_device(cfg.device)
     if hasattr(cfg.agent, "network_device") and cfg.agent.network_device != "auto":
-        network_device = resolve_device(cfg.agent.network_device)
+        network_device = _resolve_device(cfg.agent.network_device)
     else:
         network_device = device
     # Tune PyTorch intra-op threads — small MLPs on CPU benefit from fewer threads
@@ -334,19 +137,72 @@ def train(cfg: DictConfig) -> None:
 
     num_groups = cfg.collector.get("num_groups", 1)
     envs_per_group = max(1, num_envs // num_groups)
+    plr_enabled = cfg.env.get("plr", {}).get("enabled", False)
+    ns_baseline = cfg.env.get("ns_baseline", False)
+
+    # Manager().Queue() uses a proxy object that works across process boundaries
+    # regardless of spawn/fork start method. Plain mp.Queue() can silently
+    # disconnect when pickled through ParallelEnv workers.
+    if plr_enabled:
+        _plr_mp_manager = mp.Manager()
+        plr_stats_queue = _plr_mp_manager.Queue(maxsize=2000)
+        # Shared array written by main process after GAE; each worker reads its own slot.
+        # Size = envs_per_group: groups share slots (same policy, similar scores).
+        plr_score_array = _plr_mp_manager.Array('d', [0.0] * envs_per_group)
+        collector_factory = None  # replaced by per-worker factory lists below
+    elif ns_baseline:
+        _plr_mp_manager = None
+        plr_stats_queue = None
+        plr_score_array = None
+        collector_factory = partial(make_ns_random_env, cfg, device, obs_rms, network_dtype)
+    else:
+        _plr_mp_manager = None
+        plr_stats_queue = None
+        plr_score_array = None
+        collector_factory = partial(make_single_env, cfg, device, obs_rms, network_dtype)
+
     collector_envs = [
-        make_parallel_env(cfg, device, num_envs=envs_per_group, dtype=network_dtype, obs_rms=obs_rms)
-        for _ in range(num_groups)
+        ParallelEnv(
+            num_workers=envs_per_group,
+            create_env_fn=(
+                [
+                    partial(make_ns_plr_env, cfg, device, obs_rms, network_dtype,
+                            plr_stats_queue,
+                            worker_idx=w,
+                            score_array=plr_score_array)
+                    for w in range(envs_per_group)
+                ]
+                if plr_enabled else collector_factory
+            ),
+            serial_for_single=True,
+        )
+        for g in range(num_groups)
     ]
+
     # Use first env only for shape logging
     env = collector_envs[0]
-    log.info("Env: %s | num_groups=%d | envs_per_group=%d | total_envs=%d | obs=%s  act=%s",
-             cfg.env.id, num_groups, envs_per_group, num_groups * envs_per_group,
-             env.observation_spec["observation"].shape,
-             env.action_spec.shape)
+    train_mode = "PLR" if plr_enabled else ("NS-baseline" if ns_baseline else "stationary")
+    log.info(
+        "Env: %s | mode=%s | num_groups=%d | envs_per_group=%d | total_envs=%d | obs=%s  act=%s",
+        cfg.env.id, train_mode, num_groups, envs_per_group, num_groups * envs_per_group,
+        env.observation_spec["observation"].shape,
+        env.action_spec.shape,
+    )
 
     num_eval_episodes = cfg.training.get("num_eval_episodes", 5)
-    eval_env = make_parallel_env(cfg, device, num_envs=num_eval_episodes, obs_rms=obs_rms, dtype=network_dtype)
+    if plr_enabled or ns_baseline:
+        n_configs = cfg.env.plr.num_eval_configs
+        eval_shard_factories = make_ns_eval_shards(cfg, device, obs_rms=obs_rms, dtype=network_dtype)
+        log.info(
+            "Eval: %d held-out NS configs (seed=%d), %d parallel eval envs, %d shard(s)",
+            n_configs, cfg.env.plr.eval_seed, num_eval_episodes, len(eval_shard_factories),
+        )
+    else:
+        # Single shard of num_eval_episodes base-env instances.
+        eval_shard_factories = [
+            [partial(make_single_env, cfg, device, obs_rms, network_dtype)
+             for _ in range(num_eval_episodes)]
+        ]
 
     # ── Build PPO modules ──────────────────────────────────────────────
     # Set RPO alpha before building models (distribution class reads it)
@@ -357,11 +213,29 @@ def train(cfg: DictConfig) -> None:
 
     models = make_ppo_models(env, cfg, device=device, network_device=network_device, dtype=network_dtype)
     actor = models["actor"]
+    critic = models.get("critic") 
     advantage_module = models["advantage"]
     loss_module = models["loss_module"]
     optimizer = models["optimizer"]
     scheduler = models["scheduler"]
     optim_params = models["optim_params"]
+
+    # ── Continual Backpropagation (optional) ──────────────────────────
+    cbp = None
+    cbp_cfg = cfg.agent.get("cbp", None)
+    if cbp_cfg and cbp_cfg.get("enabled", False):
+        cbp = ContinualBackpropagation(
+            model=loss_module,          # wraps actor + critic weights
+            optimizer=optimizer,
+            reset_rate=cbp_cfg.get("reset_rate", 0.01),
+            maturity_threshold=cbp_cfg.get("maturity_threshold", 50),
+            utility_decay=cbp_cfg.get("utility_decay", 0.05),
+            reset_init=cbp_cfg.get("reset_init", "uniform"),
+            momentum=cbp_cfg.get("momentum", 0.9),
+            device=network_device,
+        )
+        log.info("CBP enabled — reset_rate=%.3f  maturity_threshold=%d",
+                 cbp_cfg.reset_rate, cbp_cfg.maturity_threshold)
     
     # ── Data collector ─────────────────────────────────────────────────
     # ObservationNorm is in the env transforms → observations in tensordict
@@ -378,20 +252,56 @@ def train(cfg: DictConfig) -> None:
     ckpt_dir = Path(cfg.training.checkpoint_dir)
     ckpt_dir.mkdir(parents=True, exist_ok=True)
 
+    # ── Context metadata (for inference-time obs reconstruction) ──────
+    from omegaconf import OmegaConf as _OC
+    _context_keys = list(cfg.env.get("context_features", []) or [])
+    _raw_defaults = cfg.env.get("context_defaults", {}) or {}
+    _context_defaults = {k: list(v) for k, v in _OC.to_container(_raw_defaults, resolve=True).items()}
+    # n_state: number of discrete states before context augmentation (None for continuous)
+    import gymnasium as _gym
+    _tmp_env = _gym.make(cfg.env.id)
+    _n_state = _tmp_env.observation_space.n if hasattr(_tmp_env.observation_space, "n") else None
+    _tmp_env.close()
+    del _tmp_env
+    _context_meta = {
+        "context_keys": _context_keys,
+        "context_defaults": _context_defaults,
+        "n_state": _n_state,
+    }
+
     # ── V-trace setup ──────────────────────────────────────────────────
     use_vtrace = cfg.agent.get("use_vtrace", False)
     if use_vtrace:
         log.info("V-trace off-policy correction enabled for async collector")
 
+    # ── Warmup torch.compile before any env teardown can race with it ──
+    # The first actor(td) call triggers dynamo tracing. If an eval env's
+    # __del__ fires concurrently (resetting num_threads), dynamo raises an
+    # AssertionError inside __del__ which Python suppresses — benign but noisy.
+    # Forcing a compile pass here ensures tracing finishes before the first
+    # eval shard is torn down.
+    with torch.no_grad():
+        _warmup_td = collector_envs[0].reset()
+        actor(_warmup_td)
+        del _warmup_td
+
     # ── Training loop ──────────────────────────────────────────────────
     total_frames = cfg.collector.total_frames
     pbar = tqdm(total=total_frames, desc="Training")
 
+    # Eval scheduling: trigger eval at evenly-spaced frame thresholds.
+    # eval_ratio=0.1 → eval at 0%, 10%, 20%, …, 100% of total_frames.
+    eval_ratio = cfg.training.get("eval_ratio", 0.1)
+    eval_every_frames = max(1, int(total_frames * eval_ratio))
+    next_eval_frame = 0  # eval on first iteration
+
     global_step = 0
+    best_eval_iqm = float("-inf")
 
     for collect_iter, tensordict_data in enumerate(collector):
         batch_frames = tensordict_data.numel()
         global_step += batch_frames
+        did_eval_this_iter = False
 
         # Drop actor intermediate outputs — ClipPPOLoss recomputes them from
         # "observation"; keeping them just wastes memory and TensorDict ops.
@@ -440,6 +350,16 @@ def train(cfg: DictConfig) -> None:
             with torch.no_grad():
                 advantage_module(tensordict_data)
 
+        # Write per-env mean |advantage| to shared array so each PLREnv
+        # subprocess can read its own TD score at the next episode reset.
+        if plr_score_array is not None:
+            # Each batch is one group's data: shape [envs_per_group, T] or flat.
+            # Groups share score slots (same policy → similar scores).
+            td_2d = (tensordict_data.reshape(envs_per_group, -1)
+                     if tensordict_data.ndim == 1 else tensordict_data)
+            for w in range(td_2d.shape[0]):
+                plr_score_array[w] = float(td_2d[w]["advantage"].abs().mean().item())
+
         data_view = tensordict_data.reshape(-1)
         n_sub = cfg.collector.frames_per_batch // cfg.training.sub_batch_size
 
@@ -467,6 +387,9 @@ def train(cfg: DictConfig) -> None:
                 )
                 optimizer.step()
                 optimizer.zero_grad(set_to_none=True)
+
+                if cbp is not None:
+                    cbp.step(global_step)
 
                 epoch_losses["loss_objective"].append(loss_vals["loss_objective"].detach())
                 epoch_losses["loss_critic"].append(loss_vals["loss_critic"].detach())
@@ -509,59 +432,55 @@ def train(cfg: DictConfig) -> None:
         }
 
         # ── Evaluation ────────────────────────────────────────────────
-        if collect_iter % cfg.training.eval_interval == 0:
-            # Run all eval episodes in parallel: N envs step simultaneously,
-            # done_mask stops reward accumulation once each env finishes so
-            # auto-reset doesn't corrupt episode returns.
-            ep_returns = torch.zeros(num_eval_episodes, device=device)
-            ep_lengths = torch.zeros(num_eval_episodes, dtype=torch.long, device=device)
-            finished = torch.zeros(num_eval_episodes, dtype=torch.bool, device=device)
+        if global_step >= next_eval_frame:
+            did_eval_this_iter = True
+            next_eval_frame += eval_every_frames
 
-            with set_exploration_type(ExplorationType.DETERMINISTIC), torch.no_grad():
-                td = eval_env.reset()
-                for _ in range(cfg.training.eval_rollout_steps):
-                    td = actor(td)
-                    td = eval_env.step(td)
-
-                    reward = td["next", "reward"].squeeze(-1)
-                    done = (td["next", "terminated"] | td["next", "truncated"]).squeeze(-1)
-
-                    ep_returns += reward * ~finished
-                    ep_lengths += (~finished).long()
-                    finished = finished | done
-
-                    if finished.all():
-                        break
-
-                    td = step_mdp(td)
-
-            eval_reward_sum = ep_returns.mean().item()
-            eval_steps = ep_lengths.float().mean().item()
-
-            metrics.update({
-                "eval/reward_sum": eval_reward_sum,
-                "eval/reward_mean": eval_reward_sum / max(eval_steps, 1),
-                "eval/step_count": eval_steps,
-            })
-            log.info(
-                "[iter %d | frames %d] eval_return=%.2f  eval_steps=%.1f",
-                collect_iter, global_step, eval_reward_sum, eval_steps,
+            eval_results = run_eval_shards(
+                actor,
+                eval_shard_factories,
+                eval_rollout_steps=cfg.training.eval_rollout_steps,
+                device=device,
             )
+            eval_reward_mean = eval_results["eval/reward_mean"]
+            eval_reward_iqm = eval_results["eval/reward_iqm"]
+            best_eval_iqm = max(best_eval_iqm, eval_reward_iqm)
+            metrics.update({k: v for k, v in eval_results.items() if k not in ("n_shards", "n_configs")})
+            log.info(
+                "[iter %d | frames %d] eval_return=%.2f  eval_iqm=%.2f  eval_steps=%.1f  (%d configs, %d shards)",
+                collect_iter, global_step, eval_reward_mean, eval_reward_iqm,
+                eval_results["eval/step_count"], eval_results["n_configs"], eval_results["n_shards"],
+            )
+
+        # ── PLR buffer stats (aggregated from all worker subprocesses) ───
+        if plr_stats_queue is not None:
+            plr_samples = []
+            while True:
+                try:
+                    plr_samples.append(plr_stats_queue.get_nowait())
+                except Exception:
+                    break
+            if plr_samples:
+                plr_keys = plr_samples[0].keys()
+                metrics.update({
+                    k: sum(s[k] for s in plr_samples) / len(plr_samples)
+                    for k in plr_keys
+                })
 
         if cfg.wandb.enabled:
             wandb.log(metrics, step=global_step)
 
         pbar.update(batch_frames)
         postfix = dict(reward=f"{mean_reward:.3f}")
-        if collect_iter % cfg.training.eval_interval == 0:
-            postfix["eval_return"] = f"{eval_reward_sum:.2f}"
+        if did_eval_this_iter:
+            postfix["eval_return"] = f"{eval_reward_mean:.2f}  iqm={eval_reward_iqm:.2f}"
         pbar.set_postfix(postfix)
 
         # ── Checkpointing ─────────────────────────────────────────────
         if collect_iter % cfg.training.save_interval == 0 and collect_iter > 0:
             ckpt_path = ckpt_dir / f"ppo_iter_{collect_iter}.pt"
-            agent = PPOAgent(actor=actor, device=device,
-                             obs_rms=obs_rms)
+            agent = PPOAgent(actor=actor, critic=critic, device=device,
+                             obs_rms=obs_rms, context_meta=_context_meta)
             agent.save(str(ckpt_path))
             log.info("Saved checkpoint → %s", ckpt_path)
 
@@ -572,12 +491,34 @@ def train(cfg: DictConfig) -> None:
             e.close()
         except RuntimeError:
             pass  # Already closed by collector shutdown
-    eval_env.close()
-
     # ── Final save ─────────────────────────────────────────────────────
     final_path = ckpt_dir / "ppo_final.pt"
-    PPOAgent(actor=actor, device=device, obs_rms=obs_rms).save(str(final_path))
+    print(critic)
+    PPOAgent(actor=actor, critic=critic, device=device, obs_rms=obs_rms, context_meta=_context_meta).save(str(final_path))
     log.info("Training complete. Final model → %s", final_path)
+
+    if _plr_mp_manager is not None:
+        _plr_mp_manager.shutdown()
+
+    # ── Hyperparameter search output ───────────────────────────────────────
+    # Written when train.py is launched by hparam_search.py via the
+    # `+hparam_output_path=<file>` Hydra override.
+    hparam_output_path = cfg.get("hparam_output_path", None)
+    if hparam_output_path:
+        import json as _json
+        Path(hparam_output_path).write_text(
+            _json.dumps({"eval/reward_iqm": best_eval_iqm})
+        )
+        log.info("Wrote hparam metric to %s (best eval/reward_iqm=%.4f)", hparam_output_path, best_eval_iqm)
+
+    compute_and_save_fisher(
+        model_path=str(final_path),
+        output_path=str(final_path),
+        actor=actor,
+        tensordict_data=tensordict_data,
+        device=str(device),   # str(device) ..
+        n_samples=cfg.get("fisher_samples", 2000)
+    )
 
     if cfg.wandb.enabled:
         wandb.finish()

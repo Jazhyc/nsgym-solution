@@ -552,6 +552,7 @@ def make_ppo_models(
 
     return {
         "actor": actor,
+        "critic": critic,
         "advantage": advantage,
         "loss_module": loss_module,
         "optimizer": optimizer,
@@ -579,29 +580,35 @@ class PPOAgent(ModelFreeAgent):
     def __init__(
         self,
         actor: ProbabilisticActor,
+        critic = None,
         device: torch.device | str = "cpu",
         deterministic: bool = True,
         obs_rms: Any | None = None,
+        context_meta: dict | None = None,
     ) -> None:
         super().__init__()
         self.actor = actor
+        self.critic = critic
         self.device = torch.device(device)
         self.deterministic = deterministic
 
         # Store obs normalisation stats (mean / std tensors)
         if obs_rms is not None:
             if hasattr(obs_rms, "mean"):  # RunningMeanStd object
-                self._obs_mean = obs_rms.mean.clone().to(self.device)
-                self._obs_std = obs_rms.std.clone().to(self.device)
+                self._obs_mean = obs_rms.mean.clone().to(self.device).float()
+                self._obs_std = obs_rms.std.clone().to(self.device).float()
             elif isinstance(obs_rms, dict):  # loaded from checkpoint
-                self._obs_mean = obs_rms["mean"].to(self.device)
-                self._obs_std = obs_rms["std"].to(self.device)
+                self._obs_mean = obs_rms["mean"].to(self.device).float()
+                self._obs_std = obs_rms["std"].to(self.device).float()
             else:
                 self._obs_mean = None
                 self._obs_std = None
         else:
             self._obs_mean = None
             self._obs_std = None
+
+        # Context metadata for inference-time obs reconstruction
+        self.context_meta = context_meta or {}
 
     def get_action(self, obs: Dict) -> np.ndarray:
         state = obs["state"]
@@ -646,8 +653,12 @@ class PPOAgent(ModelFreeAgent):
     def save(self, path: str) -> None:
         """Persist the actor (and obs normalisation stats) so it can be loaded later."""
         ckpt: dict[str, Any] = {"actor": self.actor}
+        if self.critic is not None:
+            ckpt["critic"] = self.critic
         if self._obs_mean is not None:
             ckpt["obs_rms"] = {"mean": self._obs_mean.cpu(), "std": self._obs_std.cpu()}
+        if self.context_meta:
+            ckpt["context_meta"] = self.context_meta
         torch.save(ckpt, path)
 
     def set_seed(self, seed: int) -> None:

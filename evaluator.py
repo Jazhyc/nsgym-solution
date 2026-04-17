@@ -34,7 +34,7 @@ def evaluate_local(num_episodes=10, start_seed=42):
     for env_id, base_env_id in ENVIRONMENTS.items():
         for change_notification, delta_change_notification, notify_label in NOTIFICATIONS:
 
-            agent = get_agent(base_env_id)
+            agent = get_agent(base_env_id, notify_label)
             env = gym.make(
                 env_id,
                 change_notification=change_notification,

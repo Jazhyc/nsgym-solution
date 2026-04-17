@@ -3,6 +3,32 @@ id: Ant-v5
 frame_skip: 5
 
 # Observation / reward transforms applied by TorchRL
+frame_stack: 1                  # number of consecutive frames to stack along obs dim (1 = disabled)
 normalize_obs: true
 normalize_obs_init_steps: 1000  # random steps for initial stats bootstrap
 normalize_reward: true          # VecNormalize-style reward scaling
+
+# ── NS training mode ─────────────────────────────────────────────────────
+# ns_baseline: true  → random NS config per episode, no PLR curriculum.
+#                      Eval uses same held-out NS configs as PLR (plr block below).
+# ns_baseline: false → ignored if plr.enabled=true; uses stationary env otherwise.
+ns_baseline: false
+
+# ── Prioritized Level Replay (PLR) ───────────────────────────────────────
+# Set enabled: true to rotate NS configs during training via PLR.
+# Eval always uses a fixed held-out set (eval_seed) regardless of this flag.
+plr:
+  enabled: true
+  sampler_key: ant            # key into NS_ENV_SAMPLERS
+  capacity: 200               # larger buffer for the more complex Ant param space
+  replay_prob: 0.3            # P(replay existing level) once buffer is warm
+  score_temp: 0.9             # softmax temperature (lower → greedier replay)
+  staleness_coef: 0.25         # weight for staleness in sampling distribution
+  num_eval_configs: 16        # distinct held-out configs for evaluation
+                              # Evaluated in shards of training.num_eval_episodes envs.
+                              # Can be any value ≥ 1 independent of num_eval_episodes.
+  eval_seed: 42               # separate seed so eval configs differ from training
+  # ── ACCEL mutation (set mutation_prob > 0 to enable) ─────────────────────
+  mutation_prob: 0.25          # fraction of explore steps that mutate a high-score config
+                              # 0.0 = pure PLR; 0.5 = half of explores are mutations
+  mutation_sigma: 0.2         # noise scale: std = sigma * (hi - lo) per kwarg

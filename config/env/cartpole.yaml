@@ -3,6 +3,31 @@ id: CartPole-v1
 frame_skip: 1
 
 # CartPole has a continuous 4-D observation; normalization helps.
+frame_stack: 1                  # number of consecutive frames to stack along obs dim (1 = disabled)
 normalize_obs: true
 normalize_obs_init_steps: 1000
 normalize_reward: false   # Rewards are +1 per step; no scaling needed
+
+# ── NS training mode ─────────────────────────────────────────────────────
+# ns_baseline: true  → random NS config per episode, no PLR curriculum.
+#                      Eval uses same held-out NS configs as PLR (plr block below).
+# ns_baseline: false → ignored if plr.enabled=true; uses stationary env otherwise.
+ns_baseline: false
+
+# ── Prioritized Level Replay (PLR) ───────────────────────────────────────
+# Set enabled: true to rotate NS configs during training via PLR.
+# Eval always uses a fixed held-out set (eval_seed) regardless of this flag.
+plr:
+  enabled: true
+  sampler_key: cartpole       # key into NS_ENV_SAMPLERS
+  capacity: 50               # max levels in the buffer
+  replay_prob: 0.3            # P(replay existing level) once buffer is warm
+  score_temp: 0.9             # softmax temperature (lower → greedier replay)
+  staleness_coef: 0.25        # weight for staleness in sampling distribution
+  num_eval_configs: 24        # distinct held-out configs for evaluation
+                              # Evaluated in shards of training.num_eval_episodes envs.
+                              # Can be any value ≥ 1 independent of num_eval_episodes.
+  eval_seed: 42               # separate seed so eval configs differ from training
+  # ── ACCEL mutation (set mutation_prob > 0 to enable) ─────────────────────
+  mutation_prob: 0.25         # fraction of explore steps that mutate a high-score config
+  mutation_sigma: 0.2         # noise scale: std = sigma * (hi - lo) per kwarg

@@ -6,11 +6,11 @@ See example_submission.py for an example.
 """
 
 from pathlib import Path
-from AAMAS_Comp.agent import MyModelBasedAgent, ModelFreeAgent
+from AAMAS_Comp.agent import MyModelBasedAgent, ModelFreeAgent, MyModelFreeAgent
 import gymnasium as gym
 
 
-def get_agent(env_id: str):
+def get_agent(env_id: str, notify: str = "notify-none"):  # noqa: ARG001
     """Return an agent instance configured for the given environment.
 
     Args:
@@ -18,28 +18,23 @@ def get_agent(env_id: str):
             - "FrozenLake-v1"
             - "CartPole-v1"
             - "Ant-v5"
+        notify: Notification level — "notify-full", "notify-change", or
+            "notify-none".  Used to select a context-aware model when
+            transition probabilities are available in the info dict.
 
-    Returns: 
+    Returns:
         Agent: Your initialized agent object.
     """
     if env_id == "Ant-v5":
-
-        ####################
-        ## YOUR CODE HERE ##
-        ####################
-        raise NotImplementedError(f"Sumbission not implemented for {env_id}")
+        ant_model_path = Path("models/ppo_ant/ppo_final.pt")
+        return MyModelFreeAgent(str(ant_model_path), env_id=env_id, device="cpu", online_learning=False)
 
     elif env_id == "FrozenLake-v1":
-        ####################
-        ## YOUR CODE HERE ##
-        ####################
-        raise NotImplementedError(f"Sumbission not implemented for {env_id}")
+        model_path = "models/ppo_frozenlake/ppo_final_no_notify.pt"
+        return MyModelFreeAgent(model_path, env_id=env_id, device="cpu", online_learning=False)
 
     elif env_id == "CartPole-v1":
-        ####################
-        ## YOUR CODE HERE ##
-        ####################
-        raise NotImplementedError(f"Sumbission not implemented for {env_id}")
+        return MyModelFreeAgent("models/ppo_cartpole/ppo_final.pt", env_id=env_id, device="cpu", online_learning=False)
 
     else:
         raise ValueError(f"{env_id} not in: Ant-v5, FrozenLake-v1, CartPole-v1")

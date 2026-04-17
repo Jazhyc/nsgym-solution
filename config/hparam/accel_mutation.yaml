@@ -1,0 +1,44 @@
+# Hyperparameter search for ACCEL mutation parameters on Ant-v5.
+# Sweeps mutation_prob and mutation_sigma to find the best ACCEL config.
+#
+# Run with:
+#   python scripts/hparam_search.py config/hparam/accel_mutation.yaml
+
+env: ant
+n_trials: 30
+seed: 2
+metric: eval/reward_iqm
+direction: maximize
+
+hydra:
+  run:
+    dir: logs/runs/${now:%Y-%m-%d}/${now:%H-%M-%S}
+  sweep:
+    dir: logs/multirun/${now:%Y-%m-%d}/${now:%H-%M-%S}
+    subdir: ${hydra.job.num}
+
+fixed_overrides:
+  collector.total_frames: 10_000_000
+  training.eval_ratio: 0.2
+  # Keep PLR params at tuned values so we isolate the ACCEL effect
+  env.plr.replay_prob: 0.3
+  env.plr.score_temp: 0.9
+  env.plr.staleness_coef: 0.25
+  hydra.run.dir: logs/hparam/accel_mutation_search
+
+wandb:
+  project: nsgym-hparam-ant
+  group: accel_mutation_search
+
+params:
+  - name: env.plr.mutation_prob
+    type: float
+    distribution: uniform
+    low: 0.0
+    high: 0.5
+
+  - name: env.plr.mutation_sigma
+    type: float
+    distribution: log_uniform
+    low: 0.05
+    high: 0.5
