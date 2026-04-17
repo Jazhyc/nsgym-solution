@@ -3,7 +3,7 @@ from typing import Dict, Optional
 
 import numpy as np
 import torch
-from torch.distributions import Normal, Categorical
+from torch.distributions import Normal
 from tensordict import TensorDict
 from torchrl.envs.utils import ExplorationType, set_exploration_type
 
@@ -408,7 +408,10 @@ class MyModelFreeAgent(ModelFreeAgent):
             logits = net_out.squeeze(0)
             if self.deterministic:
                 return int(logits.argmax().item())
-            return int(Categorical(logits=logits).sample().item())
+            # Gumbel-max: argmax(logits + Gumbel) ~ Categorical(logits)
+            # Gumbel(0,1) = -log(Exponential(1)), all in-place to avoid allocations
+            noise = torch.empty_like(logits).exponential_().log_().neg_()
+            return int((logits + noise).argmax().item())
 
         # Continuous: NormalParamExtractor returns (loc, scale) tuple
         loc, scale = net_out
