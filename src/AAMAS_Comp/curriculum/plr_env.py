@@ -27,12 +27,15 @@ import gymnasium as gym
 from AAMAS_Comp.envs.ns_env_factory import NSEnvConfig, NSEnvFactory
 from AAMAS_Comp.envs.fast_ns_wrapper import FastNSClassicControlWrapper
 from AAMAS_Comp.envs.ns_env_sampler import NS_ENV_SAMPLERS
+from AAMAS_Comp.envs.wrappers import ContextFlatWrapper
 from AAMAS_Comp.curriculum.plr import PLRBuffer
 
 # Env families that benefit from FastNSClassicControlWrapper
 _CLASSIC_CONTROL_IDS = {"CartPole-v1", "MountainCar-v0", "Acrobot-v1", "Pendulum-v1"}
 # MuJoCo env IDs whose NS wrapper returns a composite dict obs keyed by tunable param names
 _MUJOCO_IDS = {"Ant-v5", "HalfCheetah-v5", "Hopper-v5", "Walker2d-v5", "Humanoid-v5"}
+# NSWrapper envs that return dict obs {"state": int, ...} — need ContextFlatWrapper
+_DICT_OBS_IDS = {"FrozenLake-v1"}
 
 
 class _MujocoRawObsAdapter(gym.Wrapper):
@@ -66,13 +69,19 @@ class _MujocoRawObsAdapter(gym.Wrapper):
         return obs, reward, terminated, truncated, info
 
 
-def _build_ns_env(config: NSEnvConfig) -> gym.Env:
+def _build_ns_env(
+    config: NSEnvConfig,
+    context_keys: list[str] | None = None,
+    context_defaults: dict | None = None,
+) -> gym.Env:
     """Build the appropriate NS wrapper for a given config.
 
     - Classic control: FastNSClassicControlWrapper (raw array obs, low overhead).
     - MuJoCo: MujocoWrapper via NSEnvFactory + _MujocoRawObsAdapter (strips
       the composite dict obs so the obs space is stable across PLR configs).
-    - Other (e.g. FrozenLake): NSEnvFactory.make() as-is.
+    - Dict-obs envs (FrozenLake): NSEnvFactory + ContextFlatWrapper (converts
+      the NSWrapper dict obs to a flat float32 array and optionally appends
+      context features read from the info dict).
     """
     if config.env_id in _CLASSIC_CONTROL_IDS:
         base = gym.make(config.env_id, **config.gym_kwargs)
@@ -81,7 +90,10 @@ def _build_ns_env(config: NSEnvConfig) -> gym.Env:
     if config.env_id in _MUJOCO_IDS:
         ns_env = NSEnvFactory.make(config)
         return _MujocoRawObsAdapter(ns_env)
-    return NSEnvFactory.make(config)
+    ns_env = NSEnvFactory.make(config)
+    if config.env_id in _DICT_OBS_IDS:
+        return ContextFlatWrapper(ns_env, context_keys or [], context_defaults or {})
+    return ns_env
 
 
 class PLREnv(gym.Env):
@@ -118,8 +130,12 @@ class PLREnv(gym.Env):
         stats_queue=None,
         worker_idx: int = 0,
         score_array=None,
+        context_keys: list[str] | None = None,
+        context_defaults: dict | None = None,
     ) -> None:
         super().__init__()
+        self._context_keys = list(context_keys or [])
+        self._context_defaults = dict(context_defaults or {})
         sampler = NS_ENV_SAMPLERS[sampler_key](seed=seed)
         self.plr = PLRBuffer(
             sampler,
@@ -143,7 +159,7 @@ class PLREnv(gym.Env):
 
         # Build a throwaway env to read spaces, then discard it
         _, init_config = self.plr.sample()
-        tmp = _build_ns_env(init_config)
+        tmp = _build_ns_env(init_config, self._context_keys, self._context_defaults)
         self.observation_space = tmp.observation_space
         self.action_space = tmp.action_space
         tmp.close()
@@ -182,7 +198,7 @@ class PLREnv(gym.Env):
 
         if self._env is not None:
             self._env.close()
-        self._env = _build_ns_env(config)
+        self._env = _build_ns_env(config, self._context_keys, self._context_defaults)
 
         self._episode_return = 0.0
         obs, info = self._env.reset(seed=seed, options=options)
@@ -211,14 +227,22 @@ class RandomNSEnv(gym.Env):
         seed:        RNG seed (None → OS entropy so each worker differs).
     """
 
-    def __init__(self, sampler_key: str = "cartpole", seed: int | None = None) -> None:
+    def __init__(
+        self,
+        sampler_key: str = "cartpole",
+        seed: int | None = None,
+        context_keys: list[str] | None = None,
+        context_defaults: dict | None = None,
+    ) -> None:
         super().__init__()
+        self._context_keys = list(context_keys or [])
+        self._context_defaults = dict(context_defaults or {})
         self._sampler = NS_ENV_SAMPLERS[sampler_key](seed=seed)
         self._env: gym.Env | None = None
 
         # Build a throwaway env to read spaces, then discard it
         config = self._sampler.sample()
-        tmp = _build_ns_env(config)
+        tmp = _build_ns_env(config, self._context_keys, self._context_defaults)
         self.observation_space = tmp.observation_space
         self.action_space = tmp.action_space
         tmp.close()
@@ -227,7 +251,7 @@ class RandomNSEnv(gym.Env):
         config = self._sampler.sample()
         if self._env is not None:
             self._env.close()
-        self._env = _build_ns_env(config)
+        self._env = _build_ns_env(config, self._context_keys, self._context_defaults)
         return self._env.reset(seed=seed, options=options)
 
     def step(self, action):
@@ -250,9 +274,14 @@ class FixedNSEnv(gym.Env):
         config: Pre-sampled NSEnvConfig to use for every episode.
     """
 
-    def __init__(self, config: NSEnvConfig) -> None:
+    def __init__(
+        self,
+        config: NSEnvConfig,
+        context_keys: list[str] | None = None,
+        context_defaults: dict | None = None,
+    ) -> None:
         super().__init__()
-        self._env = _build_ns_env(config)
+        self._env = _build_ns_env(config, context_keys or [], context_defaults or {})
         self.observation_space = self._env.observation_space
         self.action_space = self._env.action_space
 

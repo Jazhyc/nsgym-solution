@@ -102,7 +102,7 @@ class MyModelFreeAgent(ModelFreeAgent):
     def __init__(
         self,
         model_path: str,
-        env_id: str,
+        env_id: str = "",
         device: str = "cpu",
         lam: float            = 0.8,
         gamma: float          = 0.99,
@@ -178,10 +178,50 @@ class MyModelFreeAgent(ModelFreeAgent):
                 lr=lr, gamma=gamma, lamda=lam, kappa=kappa_v,
             )
 
+        # ── Context features (for inference-time obs reconstruction) ─────────
+        _ctx = ckpt.get("context_meta", {})
+        self._ctx_keys: list[str]       = _ctx.get("context_keys", [])
+        self._ctx_defaults: dict        = _ctx.get("context_defaults", {})
+        self._n_state: int | None       = _ctx.get("n_state", None)
+        # Current context cache — updated via update_context(info) in evaluator
+        self._last_context: dict[str, np.ndarray] = {
+            k: np.array(self._ctx_defaults.get(k, [0.0]), dtype=np.float32)
+            for k in self._ctx_keys
+        }
+
         # ── Transition cache ─────────────────────────────────────────────────
         self._prev_state:  Optional[torch.Tensor] = None
         self._prev_action: Optional[torch.Tensor] = None
         self._prev_relative_time = None
+
+    def update_context(self, info: dict) -> None:
+        """Cache context values from a step's info dict.
+
+        Call this in the evaluator loop after env.step() so the next
+        get_action() call uses the latest transition probability.
+        At competition time (info not passed), the cache retains defaults.
+        """
+        for k in self._ctx_keys:
+            if k in info:
+                self._last_context[k] = np.array(info[k], dtype=np.float32)
+
+    def _prepare_obs(self, raw_state) -> np.ndarray:
+        """Build the flat obs vector the network expects.
+
+        - Flat array (training/local-eval via ContextFlatWrapper): return as-is.
+        - Dict obs (competition eval): one-hot encode + append cached context.
+        """
+        if isinstance(raw_state, np.ndarray) and raw_state.ndim >= 1:
+            return raw_state  # already flat from ContextFlatWrapper
+        # Discrete int obs: one-hot encode then append context
+        if self._n_state is not None:
+            one_hot = np.zeros(self._n_state, dtype=np.float32)
+            one_hot[int(raw_state)] = 1.0
+            if self._ctx_keys:
+                ctx = np.concatenate([self._last_context[k] for k in self._ctx_keys])
+                return np.concatenate([one_hot, ctx])
+            return one_hot
+        return np.array(raw_state, dtype=np.float32)
 
     def _normalise(self, state: np.ndarray) -> torch.Tensor:
         s = torch.as_tensor(state, dtype=torch.float32, device=self.device)
@@ -294,7 +334,7 @@ class MyModelFreeAgent(ModelFreeAgent):
 
 
     def get_action(self, obs: Dict) -> np.ndarray:
-        raw_state  = obs["state"]        if isinstance(obs, dict) else obs
+        raw_state     = obs["state"] if isinstance(obs, dict) else obs
         relative_time = obs.get("relative_time", None) if isinstance(obs, dict) else None
 
         # Episodes is finished if the relative time resets back to 0
@@ -304,7 +344,7 @@ class MyModelFreeAgent(ModelFreeAgent):
             and relative_time < self._prev_relative_time
         )
         self._prev_relative_time = relative_time
-        s = self._normalise(raw_state)
+        s = self._normalise(self._prepare_obs(raw_state))
 
         if self.online_learning and self._prev_state is not None:
             r = self._compute_reward(

@@ -15,7 +15,7 @@ hydra:
 collector:
   num_envs: 24
   num_groups: 2
-  total_frames: 100_000   # performance deteriorates with over-training?
+  total_frames: 1_000_000   # performance deteriorates with over-training?
   frames_per_batch: 512
   max_frames_per_traj: 200  # FrozenLake-v1 episode cap
 
@@ -31,7 +31,7 @@ training:
   eval_ratio: 0.2            # evaluate every X% of total training frames (0.1 = every 10%)
   eval_rollout_steps: 200
   num_eval_episodes: 12      # FrozenLake is high-variance
-  save_interval: 200
+  save_interval: 10000
   checkpoint_dir: checkpoints/frozenlake
 
 # ── Reproducibility ──────────────────────────────────────────────────────────

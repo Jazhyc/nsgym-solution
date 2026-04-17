@@ -584,6 +584,7 @@ class PPOAgent(ModelFreeAgent):
         device: torch.device | str = "cpu",
         deterministic: bool = True,
         obs_rms: Any | None = None,
+        context_meta: dict | None = None,
     ) -> None:
         super().__init__()
         self.actor = actor
@@ -605,6 +606,9 @@ class PPOAgent(ModelFreeAgent):
         else:
             self._obs_mean = None
             self._obs_std = None
+
+        # Context metadata for inference-time obs reconstruction
+        self.context_meta = context_meta or {}
 
     def get_action(self, obs: Dict) -> np.ndarray:
         state = obs["state"]
@@ -653,6 +657,8 @@ class PPOAgent(ModelFreeAgent):
             ckpt["critic"] = self.critic
         if self._obs_mean is not None:
             ckpt["obs_rms"] = {"mean": self._obs_mean.cpu(), "std": self._obs_std.cpu()}
+        if self.context_meta:
+            ckpt["context_meta"] = self.context_meta
         torch.save(ckpt, path)
 
     def set_seed(self, seed: int) -> None:

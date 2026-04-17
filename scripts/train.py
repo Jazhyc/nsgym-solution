@@ -252,6 +252,23 @@ def train(cfg: DictConfig) -> None:
     ckpt_dir = Path(cfg.training.checkpoint_dir)
     ckpt_dir.mkdir(parents=True, exist_ok=True)
 
+    # ── Context metadata (for inference-time obs reconstruction) ──────
+    from omegaconf import OmegaConf as _OC
+    _context_keys = list(cfg.env.get("context_features", []) or [])
+    _raw_defaults = cfg.env.get("context_defaults", {}) or {}
+    _context_defaults = {k: list(v) for k, v in _OC.to_container(_raw_defaults, resolve=True).items()}
+    # n_state: number of discrete states before context augmentation (None for continuous)
+    import gymnasium as _gym
+    _tmp_env = _gym.make(cfg.env.id)
+    _n_state = _tmp_env.observation_space.n if hasattr(_tmp_env.observation_space, "n") else None
+    _tmp_env.close()
+    del _tmp_env
+    _context_meta = {
+        "context_keys": _context_keys,
+        "context_defaults": _context_defaults,
+        "n_state": _n_state,
+    }
+
     # ── V-trace setup ──────────────────────────────────────────────────
     use_vtrace = cfg.agent.get("use_vtrace", False)
     if use_vtrace:
@@ -463,7 +480,7 @@ def train(cfg: DictConfig) -> None:
         if collect_iter % cfg.training.save_interval == 0 and collect_iter > 0:
             ckpt_path = ckpt_dir / f"ppo_iter_{collect_iter}.pt"
             agent = PPOAgent(actor=actor, critic=critic, device=device,
-                             obs_rms=obs_rms)
+                             obs_rms=obs_rms, context_meta=_context_meta)
             agent.save(str(ckpt_path))
             log.info("Saved checkpoint → %s", ckpt_path)
 
@@ -477,7 +494,7 @@ def train(cfg: DictConfig) -> None:
     # ── Final save ─────────────────────────────────────────────────────
     final_path = ckpt_dir / "ppo_final.pt"
     print(critic)
-    PPOAgent(actor=actor, critic=critic, device=device, obs_rms=obs_rms).save(str(final_path))
+    PPOAgent(actor=actor, critic=critic, device=device, obs_rms=obs_rms, context_meta=_context_meta).save(str(final_path))
     log.info("Training complete. Final model → %s", final_path)
 
     if _plr_mp_manager is not None:

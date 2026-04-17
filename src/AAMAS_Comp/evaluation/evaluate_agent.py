@@ -60,7 +60,9 @@ def run_single_episode(env, agent, seed):
 
         obs, reward, done, truncated, info = env.step(action)
 
-
+        # Give context-aware agents access to the latest transition parameters
+        if hasattr(agent, "update_context"):
+            agent.update_context(info)
 
         episode_metrics["step_number"].append(count)
         episode_metrics["observations"].append(obs["state"])

@@ -144,6 +144,14 @@ def make_parallel_env(
     )
 
 
+def _get_context_cfg(cfg: DictConfig) -> tuple[list[str], dict]:
+    """Extract context_features and context_defaults from env config."""
+    context_keys = list(cfg.env.get("context_features", []) or [])
+    raw_defaults = cfg.env.get("context_defaults", {}) or {}
+    context_defaults = {k: list(v) for k, v in raw_defaults.items()}
+    return context_keys, context_defaults
+
+
 def make_ns_plr_env(
     cfg: DictConfig,
     device: torch.device,
@@ -160,6 +168,7 @@ def make_ns_plr_env(
     """
     plr_cfg = cfg.env.plr
     frame_stack = cfg.env.get("frame_stack", 1)
+    context_keys, context_defaults = _get_context_cfg(cfg)
     plr_env = PLREnv(
         sampler_key=plr_cfg.sampler_key,
         plr_capacity=plr_cfg.capacity,
@@ -172,6 +181,8 @@ def make_ns_plr_env(
         stats_queue=stats_queue,
         worker_idx=worker_idx,
         score_array=score_array,
+        context_keys=context_keys,
+        context_defaults=context_defaults,
     )
     base_env = GymWrapper(NoInfoWrapper(plr_env), device=device)
     return TransformedEnv(base_env, Compose(*_make_env_transforms(base_env, obs_rms, frame_stack)))
@@ -191,7 +202,13 @@ def make_ns_random_env(
     """
     plr_cfg = cfg.env.plr
     frame_stack = cfg.env.get("frame_stack", 1)
-    random_env = RandomNSEnv(sampler_key=plr_cfg.sampler_key, seed=None)
+    context_keys, context_defaults = _get_context_cfg(cfg)
+    random_env = RandomNSEnv(
+        sampler_key=plr_cfg.sampler_key,
+        seed=None,
+        context_keys=context_keys,
+        context_defaults=context_defaults,
+    )
     base_env = GymWrapper(NoInfoWrapper(random_env), device=device)
     return TransformedEnv(base_env, Compose(*_make_env_transforms(base_env, obs_rms, frame_stack)))
 
@@ -205,7 +222,8 @@ def make_fixed_ns_eval_env(
 ) -> TransformedEnv:
     """Create a fixed-config NS env for held-out evaluation."""
     frame_stack = cfg.env.get("frame_stack", 1)
-    fixed_env = FixedNSEnv(config)
+    context_keys, context_defaults = _get_context_cfg(cfg)
+    fixed_env = FixedNSEnv(config, context_keys=context_keys, context_defaults=context_defaults)
     base_env = GymWrapper(NoInfoWrapper(fixed_env), device=device)
     return TransformedEnv(base_env, Compose(*_make_env_transforms(base_env, obs_rms, frame_stack)))
 
