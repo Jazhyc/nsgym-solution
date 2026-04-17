@@ -2,10 +2,17 @@ from __future__ import annotations
 from typing import Dict, Optional
 
 import io
+import logging
+import warnings
 import numpy as np
 import torch
 from torch.distributions import Normal
 from tensordict import TensorDict
+
+# torchrl.modules.mcts.scores uses functools.partial in an Enum, which Python
+# 3.13 warns about as a future incompatibility. Suppress before torchrl import.
+warnings.filterwarnings("ignore", category=FutureWarning, module="torchrl")
+
 from torchrl.envs.utils import ExplorationType, set_exploration_type
 
 from AAMAS_Comp.base_agent import ModelFreeAgent, ModelBasedAgent
@@ -179,12 +186,19 @@ class MyModelFreeAgent(ModelFreeAgent):
             export_net = self._raw_net if self._is_discrete else self._raw_net[0]
             out_names  = ['logits'] if self._is_discrete else ['raw']
             buf = io.BytesIO()
-            with torch.no_grad():
-                torch.onnx.export(
-                    export_net, torch.zeros(1, obs_dim), buf,
-                    input_names=['obs'], output_names=out_names,
-                    dynamic_axes=None, opset_version=17,
-                )
+            _onnx_log = logging.getLogger("torch.onnx")
+            _prev_level = _onnx_log.level
+            _onnx_log.setLevel(logging.ERROR)
+            try:
+                with torch.no_grad(), warnings.catch_warnings():
+                    warnings.simplefilter("ignore")
+                    torch.onnx.export(
+                        export_net, torch.zeros(1, obs_dim), buf,
+                        input_names=['obs'], output_names=out_names,
+                        dynamic_axes=None, opset_version=18,
+                    )
+            finally:
+                _onnx_log.setLevel(_prev_level)
             buf.seek(0)
             opts = ort.SessionOptions()
             opts.intra_op_num_threads = 1
