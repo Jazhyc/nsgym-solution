@@ -214,9 +214,8 @@ __marimo__/
 
 results/
 logs/
-checkpoints/
+checkpoints/*/*.pt
 !config/env
-*.pt
-!models/ppo_ant/ppo_final.pt
+!models/
 .vscode
 .serena/
