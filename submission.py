@@ -40,11 +40,9 @@ def get_agent(env_id: str, notify: str = "notify-none"):
         # feature (obs dim 19 = 16 one-hot + 3 prob values).
         # notify-change / notify-none: use the standard model (obs dim 16).
         if notify == "notify-full":
-            ctx_model = Path("models/ppo_frozenlake_ctx/ppo_final.pt")
-            std_model = Path("models/ppo_frozenlake/ppo_final.pt")
-            model_path = str(ctx_model if ctx_model.exists() else std_model)
+            model_path = "models/ppo_frozenlake/ppo_final_full_notify.pt"
         else:
-            model_path = "models/ppo_frozenlake/ppo_final.pt"
+            model_path = "models/ppo_frozenlake/ppo_final_no_notify.pt"
         return MyModelFreeAgent(model_path, env_id=env_id, device="cpu")
 
     elif env_id == "CartPole-v1":
