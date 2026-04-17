@@ -3,7 +3,7 @@ from typing import Dict, Optional
 
 import numpy as np
 import torch
-from torch.distributions import Normal
+from torch.distributions import Normal, Categorical
 from tensordict import TensorDict
 from torchrl.envs.utils import ExplorationType, set_exploration_type
 
@@ -146,6 +146,20 @@ class MyModelFreeAgent(ModelFreeAgent):
                     RuntimeWarning,
                 )
                 self.online_learning = False
+
+        # ── Fast inference: bypass TorchRL TensorDict dispatch ──────────────
+        # ProbabilisticActor stores modules as ModuleList;
+        # module[0] is the TensorDictModule wrapping the raw nn.Sequential.
+        self._raw_net = self._actor.module[0].module
+        self._is_discrete = (env_id in _DISCRETE_ENVS)
+        if not self._is_discrete:
+            try:
+                dkw = self._actor.module[1].distribution_kwargs
+                self._action_low  = dkw["low"].to(self.device)
+                self._action_high = dkw["high"].to(self.device)
+            except Exception:
+                self._action_low  = None
+                self._action_high = None
 
         # ── Obs normalisation ────────────────────────────────────────────────
         obs_rms = ckpt.get("obs_rms", None)
@@ -386,16 +400,30 @@ class MyModelFreeAgent(ModelFreeAgent):
         return action
 
     def _sample_action(self, s: torch.Tensor) -> np.ndarray:
-        td = TensorDict({"observation": s.unsqueeze(0)}, batch_size=[1],
-                        device=self.device)
-        explore = ExplorationType.DETERMINISTIC if self.deterministic \
-                else ExplorationType.RANDOM
-        with set_exploration_type(explore), torch.no_grad():
-            td = self._actor(td)
-        action = td["action"].squeeze(0).cpu().numpy()
-        if self.env_id in _DISCRETE_ENVS:
-            return int(action.argmax())
-        return action
+        obs = s.unsqueeze(0)
+        with torch.no_grad():
+            net_out = self._raw_net(obs)
+
+        if self._is_discrete:
+            logits = net_out.squeeze(0)
+            if self.deterministic:
+                return int(logits.argmax().item())
+            return int(Categorical(logits=logits).sample().item())
+
+        # Continuous: NormalParamExtractor returns (loc, scale) tuple
+        loc, scale = net_out
+        loc   = loc.squeeze(0)
+        scale = scale.squeeze(0)
+        if self.deterministic:
+            raw = loc.tanh()
+        else:
+            raw = (loc + scale * torch.randn_like(loc)).tanh()
+        # Scale from [-1, 1] to action bounds
+        if self._action_low is not None:
+            action = self._action_low + (raw + 1.0) * 0.5 * (self._action_high - self._action_low)
+        else:
+            action = raw
+        return action.cpu().numpy()
 
     def set_seed(self, seed: int):
         torch.manual_seed(seed)
