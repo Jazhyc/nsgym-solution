@@ -44,32 +44,47 @@ def profile_agent_step(agent, obs, env):
     """Break down one agent decision + env step into sub-timings."""
     timings = {}
 
-    # --- obs prep + normalise ---
+    # --- obs prep ---
     raw_state = obs["state"] if isinstance(obs, dict) else obs
     _, timings["obs_prep"] = _time(agent._prepare_obs, raw_state)
     flat_obs = agent._prepare_obs(raw_state)
-    _, timings["normalise"] = _time(agent._normalise, flat_obs)
-    s = agent._normalise(flat_obs)
 
-    # --- net forward: numpy matmul if available, else raw nn.Sequential ---
-    if getattr(agent, "_np_layers", None) is not None:
-        x = s.numpy()
+    # --- normalise (or np.copyto when norm is folded) ---
+    if getattr(agent, "_obs_buf", None) is not None:
         t0 = time.perf_counter()
-        for W, b, act in agent._np_layers:
-            x = x @ W + b
+        np.copyto(agent._obs_buf, flat_obs, casting='unsafe')
+        timings["normalise"] = time.perf_counter() - t0
+        norm_input = agent._obs_buf
+    else:
+        _, timings["normalise"] = _time(agent._normalise, flat_obs)
+        norm_input = agent._normalise(flat_obs)
+
+    # --- net forward ---
+    if getattr(agent, "_np_layers", None) is not None:
+        x = norm_input if isinstance(norm_input, np.ndarray) else norm_input.numpy()
+        t0 = time.perf_counter()
+        for (W, b, act), buf in zip(agent._np_layers, agent._np_bufs):
+            np.dot(x, W, out=buf)
+            buf += b
             if act is not None:
-                x = act(x)
+                act(buf, out=buf)
+            x = buf
         timings["raw_net_forward"] = time.perf_counter() - t0
     else:
-        obs_t = s.unsqueeze(0)
+        obs_t = norm_input.unsqueeze(0)
         t0 = time.perf_counter()
         with torch.no_grad():
             _ = agent._raw_net(obs_t)
         timings["raw_net_forward"] = time.perf_counter() - t0
 
-    # --- full _sample_action (includes raw_net + sample overhead) ---
-    _, timings["sample_action"] = _time(agent._sample_action, s)
-    action = agent._sample_action(s)
+    # --- full sample_action ---
+    if getattr(agent, "_obs_buf", None) is not None:
+        np.copyto(agent._obs_buf, flat_obs, casting='unsafe')
+        _, timings["sample_action"] = _time(agent._sample_action_np, agent._obs_buf)
+        action = agent._sample_action_np(agent._obs_buf)
+    else:
+        _, timings["sample_action"] = _time(agent._sample_action, norm_input)
+        action = agent._sample_action(norm_input)
 
     # --- env.step ---
     _, timings["env_step"] = _time(env.step, action)

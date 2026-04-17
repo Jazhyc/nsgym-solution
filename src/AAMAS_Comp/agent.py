@@ -248,6 +248,26 @@ class MyModelFreeAgent(ModelFreeAgent):
             self._obs_std_eps  = None
             self._has_obs_norm = False
 
+        # ── Numpy fast path: obs buffer + optional norm folding ─────────────
+        # Pre-allocate a float32 obs buffer so get_action can bypass torch entirely.
+        # When obs norm is present and online_learning=False, fold (x-mean)/std into
+        # the first layer's weights so normalisation costs zero at inference time:
+        #   h = ((x - mean) / std) @ W + b  =  x @ W' + b'
+        #   W' = W / std[:,None],  b' = b - (mean/std) @ W
+        self._obs_buf = None
+        self._np_norm_folded = False
+        if self._np_layers is not None:
+            obs_dim_val = self._np_layers[0][0].shape[0]
+            self._obs_buf = np.empty(obs_dim_val, dtype=np.float32)
+            if self._has_obs_norm and not self.online_learning:
+                std_eps = self._obs_std_eps.numpy()        # float32 (obs_dim,)
+                mean    = self._obs_mean.numpy()           # float32 (obs_dim,)
+                W0, b0, act0 = self._np_layers[0]
+                W0_new = np.ascontiguousarray((W0 / std_eps[:, None]).astype(np.float32))
+                b0_new = (b0 - (mean / std_eps) @ W0).astype(np.float32)
+                self._np_layers[0] = (W0_new, b0_new, act0)
+                self._np_norm_folded = True
+
         # ── EWC: freeze θ* and Fisher ────────────────────────────────────────
         if self.use_ewc:
             self._theta_star = {
@@ -449,6 +469,14 @@ class MyModelFreeAgent(ModelFreeAgent):
             and relative_time < self._prev_relative_time
         )
         self._prev_relative_time = relative_time
+
+        # Fast path (eval only): bypass torch entirely when numpy matmul is active.
+        # np.copyto handles float64→float32 without allocating; norm is pre-folded
+        # into the first layer's weights so _normalise is not needed.
+        if self._obs_buf is not None and not self.online_learning:
+            np.copyto(self._obs_buf, self._prepare_obs(raw_state), casting='unsafe')
+            return self._sample_action_np(self._obs_buf)
+
         s = self._normalise(self._prepare_obs(raw_state))
 
         if self.online_learning and self._prev_state is not None:
@@ -476,6 +504,36 @@ class MyModelFreeAgent(ModelFreeAgent):
             action, dtype=torch.float32, device=self.device
         ).detach()
         return action
+
+    def _sample_action_np(self, x: np.ndarray) -> np.ndarray:
+        """Fast eval path: x is already float32 numpy with norm pre-folded into weights."""
+        for (W, b, act), buf in zip(self._np_layers, self._np_bufs):
+            np.dot(x, W, out=buf)
+            buf += b
+            if act is not None:
+                act(buf, out=buf)
+            x = buf
+        if self._is_discrete:
+            if self.deterministic:
+                return int(x.argmax())
+            self._rng.standard_exponential(out=self._gumbel_buf, dtype=np.float32)
+            np.log(self._gumbel_buf, out=self._gumbel_buf)
+            np.subtract(x, self._gumbel_buf, out=self._gumbel_buf)
+            return int(self._gumbel_buf.argmax())
+        act_dim = x.shape[0] // 2
+        loc   = x[:act_dim]
+        scale = np.logaddexp(0.0, x[act_dim:] + self._npe_bias) + self._npe_min_val
+        if self.deterministic:
+            return np.tanh(loc)
+        self._rng.standard_normal(out=self._action_noise_buf, dtype=np.float32)
+        self._action_noise_buf *= scale
+        self._action_noise_buf += loc
+        np.tanh(self._action_noise_buf, out=self._action_noise_buf)
+        if self._action_low is not None:
+            lo = self._action_low.numpy()
+            hi = self._action_high.numpy()
+            return lo + (self._action_noise_buf + 1.0) * 0.5 * (hi - lo)
+        return self._action_noise_buf
 
     def _sample_action(self, s: torch.Tensor) -> np.ndarray:
         if self._np_layers is not None:
