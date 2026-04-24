@@ -19,7 +19,8 @@ import gymnasium as gym
 
 import ns_gym.schedulers as sched_module
 import ns_gym.update_functions as uf_module
-from ns_gym.wrappers import MujocoWrapper, NSClassicControlWrapper, NSFrozenLakeWrapper
+from ns_gym.wrappers import MujocoWrapper, NSClassicControlWrapper
+from .wrappers import FastNSFrozenLakeWrapper
 
 
 # ---------------------------------------------------------------------------
@@ -116,7 +117,7 @@ class NSEnvFactory:
         if family == "classic":
             return NSClassicControlWrapper(base_env, tunable, **common)
         if family == "frozen":
-            return NSFrozenLakeWrapper(base_env, tunable_params=tunable, **common)
+            return FastNSFrozenLakeWrapper(base_env, tunable_params=tunable, **common)
 
         raise RuntimeError(f"Unhandled family '{family}'")  # unreachable
 

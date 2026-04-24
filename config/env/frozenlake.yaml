@@ -29,7 +29,7 @@ ns_baseline: false
 plr:
   enabled: true
   sampler_key: frozenlake    # key into NS_ENV_SAMPLERS
-  capacity: 50               # smaller buffer — FrozenLake param space is narrower
+  capacity: 100               # smaller buffer — FrozenLake param space is narrower
   replay_prob: 0.5           # P(replay existing level) once buffer is warm
   score_temp: 0.1            # softmax temperature (lower → greedier replay)
   staleness_coef: 0.1        # weight for staleness in sampling distribution

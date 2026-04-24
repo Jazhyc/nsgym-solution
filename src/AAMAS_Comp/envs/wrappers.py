@@ -99,6 +99,88 @@ class ContextFlatWrapper(GymnasiumWrapper):
         return self._build_flat_obs(obs["state"]), reward, terminated, truncated, info
 
 
+class FastNSFrozenLakeWrapper(gym.Wrapper):
+    """Low-overhead NS wrapper for FrozenLake that avoids rebuilding the P dict.
+
+    NSFrozenLakeWrapper rebuilds the full transition dict (16 states × 4 actions
+    × 3 outcomes) on every scheduler update — ~250µs vs ~9µs for the base step.
+    This wrapper pre-extracts the fixed neighbor structure (next_state, reward,
+    done) as numpy arrays at init, then only updates the 3-float probability
+    vector at runtime — no dict allocation on hot path.
+
+    Args:
+        env:              Base FrozenLake-v1 gymnasium env (unwrapped).
+        tunable_params:   Dict mapping "P" → built UpdateFn object.
+        initial_prob_dist: Starting [p_straight, p_left, p_right].
+        change_notification / delta_change_notification: unused; kept for
+            API compatibility with NSFrozenLakeWrapper.
+    """
+
+    def __init__(
+        self,
+        env: gym.Env,
+        tunable_params: dict,
+        initial_prob_dist: list[float] | None = None,
+        change_notification: bool = False,
+        delta_change_notification: bool = False,
+    ) -> None:
+        super().__init__(env)
+        self._update_fn = tunable_params["P"]
+        self._initial_prob = np.array(
+            initial_prob_dist if initial_prob_dist is not None else [1/3, 1/3, 1/3],
+            dtype=np.float64,
+        )
+        self._prob = self._initial_prob.copy()
+        self._rng = np.random.default_rng()
+        self.t = 0
+        self._s = 0
+
+        # Pre-extract fixed neighbor structure from gym's P dict.
+        # neighbors shape: (n_states, n_actions, 3) — axis-2 = [straight, left, right]
+        n_s = env.observation_space.n
+        n_a = env.action_space.n
+        self._next_states = np.zeros((n_s, n_a, 3), dtype=np.int32)
+        self._rewards     = np.zeros((n_s, n_a, 3), dtype=np.float32)
+        self._dones       = np.zeros((n_s, n_a, 3), dtype=bool)
+        for s in range(n_s):
+            for a in range(n_a):
+                for i, (_, ns, r, d) in enumerate(env.unwrapped.P[s][a]):
+                    self._next_states[s, a, i] = ns
+                    self._rewards[s, a, i]     = r
+                    self._dones[s, a, i]       = d
+
+        # Match NSFrozenLakeWrapper observation space (dict with "state" key)
+        self.observation_space = gym.spaces.Dict(
+            {"state": env.observation_space}
+        )
+
+    @property
+    def initial_prob_dist(self) -> list[float]:
+        return self._initial_prob.tolist()
+
+    def reset(self, *, seed=None, options=None):
+        obs, info = self.env.reset(seed=seed, options=options)
+        self._prob = self._initial_prob.copy()
+        self._s = int(obs)
+        self.t = 0
+        info["transition_prob"] = self._prob.tolist()
+        return {"state": obs}, info
+
+    def step(self, action):
+        new_prob, _, _ = self._update_fn(self._prob.tolist(), self.t)
+        self._prob = np.asarray(new_prob, dtype=np.float64)
+        self.t += 1
+
+        i = self._rng.choice(3, p=self._prob)
+        ns  = int(self._next_states[self._s, action, i])
+        r   = float(self._rewards[self._s, action, i])
+        done = bool(self._dones[self._s, action, i])
+        self._s = ns
+
+        info = {"transition_prob": self._prob.tolist()}
+        return {"state": ns}, r, done, False, info
+
+
 class NoInfoWrapper(GymnasiumWrapper):
     """Drop the info dict from step/reset — prevents unused keys (Ant reward
     components, position/velocity diagnostics) from being serialized over IPC
