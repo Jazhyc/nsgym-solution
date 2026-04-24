@@ -80,6 +80,16 @@ class ContextFlatWrapper(GymnasiumWrapper):
     def reset(self, *, seed=None, options=None):
         self._reset_context()
         obs, info = self.env.reset(seed=seed, options=options)
+        # NSFrozenLakeWrapper doesn't include transition_prob in reset info.
+        # Walk the wrapper stack to seed the context from the actual initial
+        # distribution so step-0 context isn't stale when initial_prob_dist varies.
+        if self.context_keys and not any(k in info for k in self.context_keys):
+            curr = self.env
+            while curr is not None:
+                if hasattr(curr, "initial_prob_dist"):
+                    info = {**info, "transition_prob": list(curr.initial_prob_dist)}
+                    break
+                curr = getattr(curr, "env", None)
         self._update_context(info)
         return self._build_flat_obs(obs["state"]), info
 

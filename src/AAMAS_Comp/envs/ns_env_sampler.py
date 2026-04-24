@@ -32,7 +32,7 @@ from __future__ import annotations
 
 import numpy as np
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Callable
 
 import gymnasium as gym
 
@@ -192,12 +192,14 @@ class NSEnvSampler:
         param_specs: list[ParamSpec],
         gym_kwargs: dict[str, Any] | None = None,
         wrapper_kwargs: dict[str, Any] | None = None,
+        wrapper_kwargs_sampler: Callable[[np.random.Generator], dict] | None = None,
         seed: int | None = None,
     ):
         self.env_id = env_id
         self.param_specs = param_specs
         self.gym_kwargs = gym_kwargs or {}
         self.wrapper_kwargs = wrapper_kwargs or {}
+        self.wrapper_kwargs_sampler = wrapper_kwargs_sampler
         self.rng = np.random.default_rng(seed)
 
     def _sample_kwargs(self, ranges: dict) -> dict:
@@ -239,11 +241,15 @@ class NSEnvSampler:
         if not tunable_params:
             return self.sample()
 
+        wrapper_kwargs = {**self.wrapper_kwargs}
+        if self.wrapper_kwargs_sampler is not None:
+            wrapper_kwargs.update(self.wrapper_kwargs_sampler(self.rng))
+
         return NSEnvConfig(
             env_id=self.env_id,
             tunable_params=tunable_params,
             gym_kwargs=self.gym_kwargs,
-            wrapper_kwargs=self.wrapper_kwargs,
+            wrapper_kwargs=wrapper_kwargs,
         )
 
     def mutate(
@@ -292,11 +298,15 @@ class NSEnvSampler:
                 ),
             )
 
+        wrapper_kwargs = {**config.wrapper_kwargs}
+        if self.wrapper_kwargs_sampler is not None:
+            wrapper_kwargs.update(self.wrapper_kwargs_sampler(rng))
+
         return NSEnvConfig(
             env_id=config.env_id,
             tunable_params=new_tunable,
             gym_kwargs=config.gym_kwargs,
-            wrapper_kwargs=config.wrapper_kwargs,
+            wrapper_kwargs=wrapper_kwargs,
         )
 
     def make(self, config: NSEnvConfig | None = None) -> gym.Env:
@@ -487,6 +497,18 @@ FROZENLAKE_PARAM_SPECS: list[ParamSpec] = [
 # Named sampler catalogue
 # ---------------------------------------------------------------------------
 
+def _sample_frozenlake_wrapper_kwargs(rng: np.random.Generator) -> dict:
+    """Sample a uniform random starting distribution over the 2-simplex.
+
+    Covers the full range from near-deterministic [1,0,0] to fully slippery
+    [1/3,1/3,1/3] and everything in between, so the agent trains across the
+    same regime the competition evaluator may start from.
+    """
+    u = np.sort(rng.uniform(0.0, 1.0, 2))
+    probs = [float(u[0]), float(u[1] - u[0]), float(1.0 - u[1])]
+    return {"initial_prob_dist": probs}
+
+
 NS_ENV_SAMPLERS: dict[str, callable] = {
     "ant": lambda seed=None: NSEnvSampler(
         env_id="Ant-v5",
@@ -506,7 +528,7 @@ NS_ENV_SAMPLERS: dict[str, callable] = {
         env_id="FrozenLake-v1",
         param_specs=FROZENLAKE_PARAM_SPECS,
         gym_kwargs={"disable_env_checker": True},
-        wrapper_kwargs={"initial_prob_dist": [1/3, 1/3, 1/3]},
+        wrapper_kwargs_sampler=_sample_frozenlake_wrapper_kwargs,
         seed=seed,
     ),
 }
