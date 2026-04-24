@@ -30,6 +30,11 @@ def get_agent(env_id: str, notify: str = "notify-none"):  # noqa: ARG001
         return MyModelFreeAgent(str(ant_model_path), env_id=env_id, device="cpu", online_learning=False)
 
     elif env_id == "FrozenLake-v1":
+        # if notify == "notify-full":
+        #     model_path = "models/ppo_frozenlake/ppo_final_full_notify.pt"
+        # else:
+        
+        # Seems like model trained 
         model_path = "models/ppo_frozenlake/ppo_final_no_notify.pt"
         return MyModelFreeAgent(model_path, env_id=env_id, device="cpu", online_learning=False)
 
