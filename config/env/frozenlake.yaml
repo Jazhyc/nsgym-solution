@@ -30,7 +30,7 @@ plr:
   enabled: true
   sampler_key: frozenlake    # key into NS_ENV_SAMPLERS
   capacity: 100               # smaller buffer — FrozenLake param space is narrower
-  replay_prob: 0.5           # P(replay existing level) once buffer is warm
+  replay_prob: 0.1           # P(replay existing level) once buffer is warm
   score_temp: 0.1            # softmax temperature (lower → greedier replay)
   staleness_coef: 0.1        # weight for staleness in sampling distribution
   num_eval_configs: 24       # distinct held-out configs for evaluation
@@ -38,5 +38,5 @@ plr:
                              # Can be any value ≥ 1 independent of num_eval_episodes.
   eval_seed: 42              # separate seed so eval configs differ from training
   # ── ACCEL mutation (set mutation_prob > 0 to enable) ────────────────────
-  mutation_prob: 0.25         # fraction of explore steps that mutate a high-score config
+  mutation_prob: 0.0          # disabled — ACCEL biases toward hard slippery configs
   mutation_sigma: 0.2        # noise scale: std = sigma * (hi - lo) per kwarg

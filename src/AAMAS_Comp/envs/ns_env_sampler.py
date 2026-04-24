@@ -498,15 +498,19 @@ FROZENLAKE_PARAM_SPECS: list[ParamSpec] = [
 # ---------------------------------------------------------------------------
 
 def _sample_frozenlake_wrapper_kwargs(rng: np.random.Generator) -> dict:
-    """Sample a uniform random starting distribution over the 2-simplex.
+    """Sample a starting distribution with uniform p_straight coverage.
 
-    Covers the full range from near-deterministic [1,0,0] to fully slippery
-    [1/3,1/3,1/3] and everything in between, so the agent trains across the
-    same regime the competition evaluator may start from.
+    Samples p_straight ~ Uniform[0,1] directly, then distributes the remainder
+    between p_left and p_right uniformly. This gives:
+      - P(p_straight > 0.5) = 50%  (vs 26% for Dirichlet([2,2,2]))
+      - P(p_straight > 0.9) = 10%  (vs  0.4% for Dirichlet([2,2,2]))
+    Ensures the agent trains on the full range from near-deterministic to
+    fully slippery, matching the competition env's decay trajectory.
     """
-    u = np.sort(rng.uniform(0.0, 1.0, 2))
-    probs = [float(u[0]), float(u[1] - u[0]), float(1.0 - u[1])]
-    return {"initial_prob_dist": probs}
+    p_straight = rng.uniform(0.0, 1.0)
+    p_left = rng.uniform(0.0, 1.0 - p_straight)
+    p_right = 1.0 - p_straight - p_left
+    return {"initial_prob_dist": [float(p_straight), float(p_left), float(p_right)]}
 
 
 NS_ENV_SAMPLERS: dict[str, callable] = {
