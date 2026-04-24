@@ -20,7 +20,7 @@ ns_baseline: false
 plr:
   enabled: true
   sampler_key: cartpole       # key into NS_ENV_SAMPLERS
-  capacity: 50               # max levels in the buffer
+  capacity: 100               # max levels in the buffer
   replay_prob: 0.3            # P(replay existing level) once buffer is warm
   score_temp: 0.9             # softmax temperature (lower → greedier replay)
   staleness_coef: 0.25        # weight for staleness in sampling distribution

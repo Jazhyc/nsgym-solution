@@ -15,8 +15,8 @@ hydra:
 collector:
   num_envs: 24
   num_groups: 2
-  total_frames: 1_000_000   # converges quickly
-  frames_per_batch: 512
+  total_frames: 10_000_000   # converges quickly
+  frames_per_batch: 2560
   max_frames_per_traj: 500  # CartPole-v1 episode cap
 
 # ── CPU threading ────────────────────────────────────────────────────────────
@@ -25,8 +25,8 @@ num_threads: 4
 # ── Training loop ────────────────────────────────────────────────────────────
 training:
   num_epochs: 10
-  sub_batch_size: 64
-  max_grad_norm: 0.5
+  sub_batch_size: 256
+  max_grad_norm: 0.2
   target_kl: 0.02
   eval_ratio: 0.2            # evaluate every X% of total training frames (0.2 = every 20%)
   eval_rollout_steps: 500

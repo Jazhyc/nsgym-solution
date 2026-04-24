@@ -256,7 +256,8 @@ def train(cfg: DictConfig) -> None:
     from omegaconf import OmegaConf as _OC
     _context_keys = list(cfg.env.get("context_features", []) or [])
     _raw_defaults = cfg.env.get("context_defaults", {}) or {}
-    _context_defaults = {k: list(v) for k, v in _OC.to_container(_raw_defaults, resolve=True).items()}
+    _raw_defaults_dict = _OC.to_container(_raw_defaults, resolve=True) if _OC.is_config(_raw_defaults) else _raw_defaults
+    _context_defaults = {k: list(v) for k, v in _raw_defaults_dict.items()}
     # n_state: number of discrete states before context augmentation (None for continuous)
     import gymnasium as _gym
     _tmp_env = _gym.make(cfg.env.id)

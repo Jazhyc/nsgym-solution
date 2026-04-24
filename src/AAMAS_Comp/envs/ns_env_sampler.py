@@ -385,19 +385,64 @@ CARTPOLE_PARAM_SPECS: list[ParamSpec] = [
             "OrnsteinUhlenbeck", "BoundedRandomWalk",
         ],
         update_fn_overrides={
-            # Pole mass starts at 0.1 kg; keep mass positive
+            # Pole mass starts at 0.1 kg; competition uses k=0.1 (unbounded drift)
+            # so allow up to 0.1 here to cover that regime
+            "IncrementUpdate":   {"k":     (0.001, 0.1)},
             "DecrementUpdate":   {"k":     (0.00001, 0.001)},
             "ExponentialDecay":  {"decay_rate": (1e-6, 1e-4)},
             "OrnsteinUhlenbeck": {"theta": (0.001, 0.1),
                                   "mu":    (0.05, 1.0),
                                   "sigma": (0.001, 0.05)},
-            # lo < hi guaranteed: lo ∈ (0.01, 0.05), hi ∈ (0.3, 2.0)
+            # lo < hi guaranteed: lo ∈ (0.01, 0.05), hi ∈ (1.0, 5.0)
             "BoundedRandomWalk": {"mu":    (0.0, 0.0),
                                   "sigma": (0.005, 0.05),
                                   "lo":    (0.01, 0.05),
-                                  "hi":    (0.3, 2.0)},
+                                  "hi":    (1.0, 5.0)},
         },
         required=True,
+    ),
+    ParamSpec(
+        param_name="length",
+        schedulers=_ALL_SCHEDULERS,
+        update_fns=[
+            "IncrementUpdate", "DecrementUpdate", "RandomWalk",
+            "OrnsteinUhlenbeck", "BoundedRandomWalk",
+        ],
+        update_fn_overrides={
+            # Pole length default 0.5 m; shorter poles are much harder to balance
+            "DecrementUpdate":   {"k":     (0.00001, 0.001)},
+            "OrnsteinUhlenbeck": {"theta": (0.001, 0.1),
+                                  "mu":    (0.2, 0.8),
+                                  "sigma": (0.001, 0.05)},
+            # lo < hi guaranteed: lo ∈ (0.1, 0.3), hi ∈ (0.5, 1.0)
+            "BoundedRandomWalk": {"mu":    (0.0, 0.0),
+                                  "sigma": (0.005, 0.05),
+                                  "lo":    (0.1, 0.3),
+                                  "hi":    (0.5, 1.0)},
+        },
+        required=True,
+    ),
+    ParamSpec(
+        param_name="masscart",
+        schedulers=_ALL_SCHEDULERS,
+        update_fns=[
+            "IncrementUpdate", "DecrementUpdate", "RandomWalk",
+            "OrnsteinUhlenbeck", "BoundedRandomWalk",
+        ],
+        update_fn_overrides={
+            # Cart mass default 1.0 kg; keep positive
+            "DecrementUpdate":   {"k":     (0.0001, 0.005)},
+            "OrnsteinUhlenbeck": {"theta": (0.001, 0.1),
+                                  "mu":    (0.5, 3.0),
+                                  "sigma": (0.01, 0.1)},
+            # lo < hi guaranteed: lo ∈ (0.1, 0.5), hi ∈ (2.0, 5.0)
+            "BoundedRandomWalk": {"mu":    (0.0, 0.0),
+                                  "sigma": (0.01, 0.1),
+                                  "lo":    (0.1, 0.5),
+                                  "hi":    (2.0, 5.0)},
+        },
+        required=False,
+        include_prob=0.6,
     ),
     ParamSpec(
         param_name="gravity",
