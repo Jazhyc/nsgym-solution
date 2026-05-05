@@ -22,6 +22,10 @@ import os
 import warnings
 from pathlib import Path
 
+# Suppress FutureWarnings from torchrl (Python 3.13 compatibility issues)
+# Must be registered before any torchrl import, as the warnings fire at module load time.
+warnings.filterwarnings("ignore", category=FutureWarning, module="torchrl.modules.mcts.scores")
+
 import multiprocessing as mp
 from functools import partial
 
@@ -44,9 +48,6 @@ torch._dynamo.config.suppress_errors = True
 import wandb
 
 from AAMAS_Comp.optimizers.cbp import ContinualBackpropagation
-
-# Suppress FutureWarnings from torchrl (Python 3.13 compatibility issues)
-warnings.filterwarnings("ignore", category=FutureWarning, module="torchrl.modules.mcts.scores")
 
 from torchrl.collectors import MultiAsyncCollector
 from torchrl.envs import ParallelEnv
@@ -145,23 +146,37 @@ def train(cfg: DictConfig) -> None:
     if plr_enabled:
         _plr_mp_manager = mp.Manager()
         plr_stats_queue = _plr_mp_manager.Queue(maxsize=2000)
-        collector_factory = partial(make_ns_plr_env, cfg, device, obs_rms, network_dtype, plr_stats_queue)
+        # Shared array written by main process after GAE; each worker reads its own slot.
+        # Size = envs_per_group: groups share slots (same policy, similar scores).
+        plr_score_array = _plr_mp_manager.Array('d', [0.0] * envs_per_group)
+        collector_factory = None  # replaced by per-worker factory lists below
     elif ns_baseline:
         _plr_mp_manager = None
         plr_stats_queue = None
+        plr_score_array = None
         collector_factory = partial(make_ns_random_env, cfg, device, obs_rms, network_dtype)
     else:
         _plr_mp_manager = None
         plr_stats_queue = None
+        plr_score_array = None
         collector_factory = partial(make_single_env, cfg, device, obs_rms, network_dtype)
 
     collector_envs = [
         ParallelEnv(
             num_workers=envs_per_group,
-            create_env_fn=collector_factory,
+            create_env_fn=(
+                [
+                    partial(make_ns_plr_env, cfg, device, obs_rms, network_dtype,
+                            plr_stats_queue,
+                            worker_idx=w,
+                            score_array=plr_score_array)
+                    for w in range(envs_per_group)
+                ]
+                if plr_enabled else collector_factory
+            ),
             serial_for_single=True,
         )
-        for _ in range(num_groups)
+        for g in range(num_groups)
     ]
 
     # Use first env only for shape logging
@@ -236,6 +251,23 @@ def train(cfg: DictConfig) -> None:
     # ── Checkpoint directory ───────────────────────────────────────────
     ckpt_dir = Path(cfg.training.checkpoint_dir)
     ckpt_dir.mkdir(parents=True, exist_ok=True)
+
+    # ── Context metadata (for inference-time obs reconstruction) ──────
+    from omegaconf import OmegaConf as _OC
+    _context_keys = list(cfg.env.get("context_features", []) or [])
+    _raw_defaults = cfg.env.get("context_defaults", {}) or {}
+    _context_defaults = {k: list(v) for k, v in _OC.to_container(_raw_defaults, resolve=True).items()}
+    # n_state: number of discrete states before context augmentation (None for continuous)
+    import gymnasium as _gym
+    _tmp_env = _gym.make(cfg.env.id)
+    _n_state = _tmp_env.observation_space.n if hasattr(_tmp_env.observation_space, "n") else None
+    _tmp_env.close()
+    del _tmp_env
+    _context_meta = {
+        "context_keys": _context_keys,
+        "context_defaults": _context_defaults,
+        "n_state": _n_state,
+    }
 
     # ── V-trace setup ──────────────────────────────────────────────────
     use_vtrace = cfg.agent.get("use_vtrace", False)
@@ -317,6 +349,16 @@ def train(cfg: DictConfig) -> None:
         if not use_vtrace:
             with torch.no_grad():
                 advantage_module(tensordict_data)
+
+        # Write per-env mean |advantage| to shared array so each PLREnv
+        # subprocess can read its own TD score at the next episode reset.
+        if plr_score_array is not None:
+            # Each batch is one group's data: shape [envs_per_group, T] or flat.
+            # Groups share score slots (same policy → similar scores).
+            td_2d = (tensordict_data.reshape(envs_per_group, -1)
+                     if tensordict_data.ndim == 1 else tensordict_data)
+            for w in range(td_2d.shape[0]):
+                plr_score_array[w] = float(td_2d[w]["advantage"].abs().mean().item())
 
         data_view = tensordict_data.reshape(-1)
         n_sub = cfg.collector.frames_per_batch // cfg.training.sub_batch_size
@@ -438,7 +480,7 @@ def train(cfg: DictConfig) -> None:
         if collect_iter % cfg.training.save_interval == 0 and collect_iter > 0:
             ckpt_path = ckpt_dir / f"ppo_iter_{collect_iter}.pt"
             agent = PPOAgent(actor=actor, critic=critic, device=device,
-                             obs_rms=obs_rms)
+                             obs_rms=obs_rms, context_meta=_context_meta)
             agent.save(str(ckpt_path))
             log.info("Saved checkpoint → %s", ckpt_path)
 
@@ -452,7 +494,7 @@ def train(cfg: DictConfig) -> None:
     # ── Final save ─────────────────────────────────────────────────────
     final_path = ckpt_dir / "ppo_final.pt"
     print(critic)
-    PPOAgent(actor=actor, critic=critic, device=device, obs_rms=obs_rms).save(str(final_path))
+    PPOAgent(actor=actor, critic=critic, device=device, obs_rms=obs_rms, context_meta=_context_meta).save(str(final_path))
     log.info("Training complete. Final model → %s", final_path)
 
     if _plr_mp_manager is not None:

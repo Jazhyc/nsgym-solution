@@ -132,15 +132,25 @@ class PLRBuffer:
 
     Maintains a catalog of up to `capacity` sampled NSEnvConfig levels, each
     with an associated learning-potential score.  Balances:
-      - Exploration: sampling a fresh random config from the NSEnvSampler.
+      - Exploration:  sampling a fresh random config from the NSEnvSampler.
+      - Mutation:     perturbing a high-scoring config (ACCEL extension).
       - Exploitation: replaying a high-score level from the buffer.
 
+    When `mutation_prob > 0`, this becomes an ACCEL buffer: a fraction of the
+    explore steps are replaced by mutations of high-scoring buffer entries.
+    Set `mutation_prob=0.0` (default) for standard PLR behaviour.
+
     Args:
-        sampler:        NSEnvSampler providing new random configs.
+        sampler:        NSEnvSampler providing new random configs (and mutations).
         capacity:       Maximum number of levels held simultaneously.
         replay_prob:    Probability of replaying an existing level vs exploring
                         a new one (once `min_fill` fraction of capacity is
                         populated).  Default: 0.5.
+        mutation_prob:  Of the explore steps, fraction that are ACCEL mutations
+                        (perturbing a high-scoring config) rather than random
+                        new samples.  0.0 = pure PLR.  Default: 0.0.
+        mutation_sigma: Noise scale for mutation as a fraction of each kwarg's
+                        range width.  0.2 → std = 20% of (hi - lo).  Default: 0.2.
         score_temp:     Temperature for rank-based sampling: P ∝ (1/rank)^(1/temp).
                         temp=1 → standard 1/rank (paper default).
                         temp→0 → greedy (always rank 1).
@@ -164,6 +174,8 @@ class PLRBuffer:
         sampler: NSEnvSampler,
         capacity: int = 500,
         replay_prob: float = 0.5,
+        mutation_prob: float = 0.0,
+        mutation_sigma: float = 0.2,
         score_temp: float = 0.1,
         staleness_coef: float = 0.1,
         min_fill: float = 0.1,
@@ -173,6 +185,8 @@ class PLRBuffer:
         self.sampler = sampler
         self.capacity = capacity
         self.replay_prob = replay_prob
+        self.mutation_prob = mutation_prob
+        self.mutation_sigma = mutation_sigma
         self.score_temp = max(score_temp, 1e-8)
         self.staleness_coef = staleness_coef
         self.min_fill_count = max(1, int(capacity * min_fill))
@@ -180,7 +194,8 @@ class PLRBuffer:
         self.rng = np.random.default_rng(seed)
 
         self._entries: list[_LevelEntry] = []
-        self.last_was_replay: bool = False  # set by sample(); True = replay, False = explore
+        self.last_was_replay: bool = False    # True = replay, False = explore/mutate
+        self.last_was_mutation: bool = False  # True = ACCEL mutation, False = random explore
 
     # ── Public API ────────────────────────────────────────────────────────────
 
@@ -281,7 +296,22 @@ class PLRBuffer:
 
     def _explore(self) -> tuple[int, NSEnvConfig]:
         self.last_was_replay = False
-        config = self.sampler.sample()
+        # ACCEL: mutate a high-scoring config instead of random exploration
+        if (
+            self.mutation_prob > 0.0
+            and self.is_warm
+            and self.rng.random() < self.mutation_prob
+        ):
+            dist = self._compute_distribution()
+            parent_idx = int(self.rng.choice(len(self._entries), p=dist))
+            config = self.sampler.mutate(
+                self._entries[parent_idx].config, self.rng, self.mutation_sigma
+            )
+            self.last_was_mutation = True
+        else:
+            config = self.sampler.sample()
+            self.last_was_mutation = False
+
         if self.size >= self.capacity:
             # Evict the lowest-scoring entry
             idx = int(np.argmin([e.score for e in self._entries]))
@@ -293,6 +323,7 @@ class PLRBuffer:
 
     def _replay(self) -> tuple[int, NSEnvConfig]:
         self.last_was_replay = True
+        self.last_was_mutation = False
         dist = self._compute_distribution()
         idx = int(self.rng.choice(len(self._entries), p=dist))
         return idx, self._entries[idx].config

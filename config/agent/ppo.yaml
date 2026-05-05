@@ -31,6 +31,6 @@ network_device: cpu           # device for neural networks (cpu | cuda | auto)
 use_layer_norm: true         # add LayerNorm after each hidden layer activation
 
 # ── Performance optimizations ──────────────────────────────────────────
-compile: true                # use torch.compile for faster training
+compile: false               # torch.compile disabled: no benefit for small MLPs on CPU, and dynamo hits internal errors on Python 3.13
 compile_mode: default         # 'reduce-overhead' uses CUDA graphs (no benefit on CPU); 'default' is best for CPU
 dtype: float32               # network dtype: float32 | float16 | bfloat16 (float16/bfloat16 only beneficial on GPU)

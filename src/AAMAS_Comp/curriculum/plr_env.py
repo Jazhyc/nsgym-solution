@@ -2,7 +2,9 @@
 PLREnv — gymnasium wrapper that embeds a PLRBuffer.
 
 On every reset():
-  1. Scores the previous episode (episode return as proxy).
+  1. Scores the previous episode using mean |advantage| written by the main
+     process after GAE (correct learning-potential signal).  Falls back to
+     episode return if the score array hasn't been populated yet (first batch).
   2. Calls plr.update() to update the buffer.
   3. Samples the next config from the buffer.
   4. Rebuilds the underlying NS env from that config.
@@ -25,12 +27,15 @@ import gymnasium as gym
 from AAMAS_Comp.envs.ns_env_factory import NSEnvConfig, NSEnvFactory
 from AAMAS_Comp.envs.fast_ns_wrapper import FastNSClassicControlWrapper
 from AAMAS_Comp.envs.ns_env_sampler import NS_ENV_SAMPLERS
+from AAMAS_Comp.envs.wrappers import ContextFlatWrapper
 from AAMAS_Comp.curriculum.plr import PLRBuffer
 
 # Env families that benefit from FastNSClassicControlWrapper
 _CLASSIC_CONTROL_IDS = {"CartPole-v1", "MountainCar-v0", "Acrobot-v1", "Pendulum-v1"}
 # MuJoCo env IDs whose NS wrapper returns a composite dict obs keyed by tunable param names
 _MUJOCO_IDS = {"Ant-v5", "HalfCheetah-v5", "Hopper-v5", "Walker2d-v5", "Humanoid-v5"}
+# NSWrapper envs that return dict obs {"state": int, ...} — need ContextFlatWrapper
+_DICT_OBS_IDS = {"FrozenLake-v1"}
 
 
 class _MujocoRawObsAdapter(gym.Wrapper):
@@ -64,13 +69,19 @@ class _MujocoRawObsAdapter(gym.Wrapper):
         return obs, reward, terminated, truncated, info
 
 
-def _build_ns_env(config: NSEnvConfig) -> gym.Env:
+def _build_ns_env(
+    config: NSEnvConfig,
+    context_keys: list[str] | None = None,
+    context_defaults: dict | None = None,
+) -> gym.Env:
     """Build the appropriate NS wrapper for a given config.
 
     - Classic control: FastNSClassicControlWrapper (raw array obs, low overhead).
     - MuJoCo: MujocoWrapper via NSEnvFactory + _MujocoRawObsAdapter (strips
       the composite dict obs so the obs space is stable across PLR configs).
-    - Other (e.g. FrozenLake): NSEnvFactory.make() as-is.
+    - Dict-obs envs (FrozenLake): NSEnvFactory + ContextFlatWrapper (converts
+      the NSWrapper dict obs to a flat float32 array and optionally appends
+      context features read from the info dict).
     """
     if config.env_id in _CLASSIC_CONTROL_IDS:
         base = gym.make(config.env_id, **config.gym_kwargs)
@@ -79,7 +90,10 @@ def _build_ns_env(config: NSEnvConfig) -> gym.Env:
     if config.env_id in _MUJOCO_IDS:
         ns_env = NSEnvFactory.make(config)
         return _MujocoRawObsAdapter(ns_env)
-    return NSEnvFactory.make(config)
+    ns_env = NSEnvFactory.make(config)
+    if config.env_id in _DICT_OBS_IDS:
+        return ContextFlatWrapper(ns_env, context_keys or [], context_defaults or {})
+    return ns_env
 
 
 class PLREnv(gym.Env):
@@ -93,6 +107,11 @@ class PLREnv(gym.Env):
         sampler_key:    Key into NS_ENV_SAMPLERS ("cartpole", "ant", "frozenlake").
         plr_capacity:   Max levels in the PLR buffer.
         replay_prob:    Probability of replaying vs exploring a new config.
+        mutation_prob:  Of the explore steps, fraction that use ACCEL mutation
+                        (perturbing a high-scoring config) rather than random
+                        sampling. 0.0 = pure PLR (default).
+        mutation_sigma: Noise scale for mutation (fraction of each kwarg's range
+                        width). Default: 0.2.
         score_temp:     Softmax temperature for score-based sampling.
         staleness_coef: Weight for staleness component in sampling distribution.
         seed:           RNG seed for the PLR buffer (None → OS entropy).
@@ -103,17 +122,27 @@ class PLREnv(gym.Env):
         sampler_key: str = "cartpole",
         plr_capacity: int = 100,
         replay_prob: float = 0.5,
+        mutation_prob: float = 0.0,
+        mutation_sigma: float = 0.2,
         score_temp: float = 0.1,
         staleness_coef: float = 0.1,
         seed: int | None = None,
         stats_queue=None,
+        worker_idx: int = 0,
+        score_array=None,
+        context_keys: list[str] | None = None,
+        context_defaults: dict | None = None,
     ) -> None:
         super().__init__()
+        self._context_keys = list(context_keys or [])
+        self._context_defaults = dict(context_defaults or {})
         sampler = NS_ENV_SAMPLERS[sampler_key](seed=seed)
         self.plr = PLRBuffer(
             sampler,
             capacity=plr_capacity,
             replay_prob=replay_prob,
+            mutation_prob=mutation_prob,
+            mutation_sigma=mutation_sigma,
             score_temp=score_temp,
             staleness_coef=staleness_coef,
             seed=seed,
@@ -122,31 +151,46 @@ class PLREnv(gym.Env):
         self._episode_return: float = 0.0
         self._env: gym.Env | None = None
         self._stats_queue = stats_queue
+        self._worker_idx: int = worker_idx
+        self._score_array = score_array
         self._episode_count: int = 0
         self._replay_count: int = 0
+        self._mutation_count: int = 0
 
         # Build a throwaway env to read spaces, then discard it
         _, init_config = self.plr.sample()
-        tmp = _build_ns_env(init_config)
+        tmp = _build_ns_env(init_config, self._context_keys, self._context_defaults)
         self.observation_space = tmp.observation_space
         self.action_space = tmp.action_space
         tmp.close()
 
     def reset(self, *, seed=None, options=None):
-        # Score the episode that just ended (skip before first episode)
+        # Score the episode that just ended (skip before first episode).
+        # Prefer mean |advantage| written by the main process after GAE (correct
+        # learning-potential signal).  Fall back to episode return on the first
+        # batch before the score array has been populated (value == 0.0).
         if self._level_id is not None:
-            self.plr.update(self._level_id, self._episode_return)
+            if self._score_array is not None:
+                td_score = float(self._score_array[self._worker_idx])
+                score = td_score if td_score > 0.0 else self._episode_return
+            else:
+                score = self._episode_return
+            self.plr.update(self._level_id, score)
 
         # Sample next config and rebuild env
         self._level_id, config = self.plr.sample()
 
-        # Track replay/explore ratio and push stats to main process
+        # Track replay/mutation/explore ratios and push stats to main process
         if self.plr.last_was_replay:
             self._replay_count += 1
+        if self.plr.last_was_mutation:
+            self._mutation_count += 1
         self._episode_count += 1
         if self._stats_queue is not None:
             stats = self.plr.stats()
             stats["plr/replay_fraction"] = self._replay_count / self._episode_count
+            stats["accel/mutation_fraction"] = self._mutation_count / self._episode_count
+            stats["plr/episode_return"] = self._episode_return
             try:
                 self._stats_queue.put_nowait(stats)
             except Exception:
@@ -154,7 +198,7 @@ class PLREnv(gym.Env):
 
         if self._env is not None:
             self._env.close()
-        self._env = _build_ns_env(config)
+        self._env = _build_ns_env(config, self._context_keys, self._context_defaults)
 
         self._episode_return = 0.0
         obs, info = self._env.reset(seed=seed, options=options)
@@ -183,14 +227,22 @@ class RandomNSEnv(gym.Env):
         seed:        RNG seed (None → OS entropy so each worker differs).
     """
 
-    def __init__(self, sampler_key: str = "cartpole", seed: int | None = None) -> None:
+    def __init__(
+        self,
+        sampler_key: str = "cartpole",
+        seed: int | None = None,
+        context_keys: list[str] | None = None,
+        context_defaults: dict | None = None,
+    ) -> None:
         super().__init__()
+        self._context_keys = list(context_keys or [])
+        self._context_defaults = dict(context_defaults or {})
         self._sampler = NS_ENV_SAMPLERS[sampler_key](seed=seed)
         self._env: gym.Env | None = None
 
         # Build a throwaway env to read spaces, then discard it
         config = self._sampler.sample()
-        tmp = _build_ns_env(config)
+        tmp = _build_ns_env(config, self._context_keys, self._context_defaults)
         self.observation_space = tmp.observation_space
         self.action_space = tmp.action_space
         tmp.close()
@@ -199,7 +251,7 @@ class RandomNSEnv(gym.Env):
         config = self._sampler.sample()
         if self._env is not None:
             self._env.close()
-        self._env = _build_ns_env(config)
+        self._env = _build_ns_env(config, self._context_keys, self._context_defaults)
         return self._env.reset(seed=seed, options=options)
 
     def step(self, action):
@@ -222,9 +274,14 @@ class FixedNSEnv(gym.Env):
         config: Pre-sampled NSEnvConfig to use for every episode.
     """
 
-    def __init__(self, config: NSEnvConfig) -> None:
+    def __init__(
+        self,
+        config: NSEnvConfig,
+        context_keys: list[str] | None = None,
+        context_defaults: dict | None = None,
+    ) -> None:
         super().__init__()
-        self._env = _build_ns_env(config)
+        self._env = _build_ns_env(config, context_keys or [], context_defaults or {})
         self.observation_space = self._env.observation_space
         self.action_space = self._env.action_space
 

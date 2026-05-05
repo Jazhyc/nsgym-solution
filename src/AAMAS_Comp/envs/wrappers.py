@@ -5,8 +5,88 @@ No TorchRL dependency — safe to import from submission.py or any context.
 
 from __future__ import annotations
 
+import numpy as np
 import torch
+import gymnasium as gym
 from gymnasium import Wrapper as GymnasiumWrapper
+
+
+class ContextFlatWrapper(GymnasiumWrapper):
+    """Converts NSWrapper dict obs ``{"state": int, ...}`` to a flat float32 array.
+
+    NSFrozenLakeWrapper returns a composite dict observation that is
+    incompatible with TorchRL MLP networks.  This wrapper:
+
+      1. One-hot encodes the discrete ``obs["state"]`` integer.
+      2. Optionally appends context scalars extracted from the info dict
+         (e.g. ``info["transition_prob"]``).
+
+    The resulting observation space is ``Box(n_state + n_context,)``.
+
+    At episode reset the context is re-initialised from ``context_defaults``.
+    After every step the cache is updated from ``info`` if the key is present.
+
+    Args:
+        env: A gymnasium env whose observation space is ``Dict`` with a
+            ``"state"`` key that is ``Discrete(n)``.
+        context_keys: Ordered list of ``info`` keys to append (e.g.
+            ``["transition_prob"]``).  Empty list = one-hot only.
+        context_defaults: Mapping from key → default list value used when
+            the key is absent from ``info`` (e.g. at episode start).
+    """
+
+    def __init__(
+        self,
+        env: gym.Env,
+        context_keys: list[str] | None = None,
+        context_defaults: dict | None = None,
+    ) -> None:
+        super().__init__(env)
+        self.context_keys: list[str] = list(context_keys or [])
+        self.context_defaults: dict = dict(context_defaults or {})
+
+        self._n_state: int = env.observation_space["state"].n
+        self._context_sizes: dict[str, int] = {
+            k: len(v) for k, v in self.context_defaults.items()
+        }
+        n_context = sum(self._context_sizes.get(k, 1) for k in self.context_keys)
+
+        self._last_context: dict[str, np.ndarray] = {}
+        self._reset_context()
+
+        total_dim = self._n_state + n_context
+        self.observation_space = gym.spaces.Box(
+            low=-np.inf, high=np.inf, shape=(total_dim,), dtype=np.float32
+        )
+
+    def _reset_context(self) -> None:
+        for k in self.context_keys:
+            default = self.context_defaults.get(k, [0.0])
+            self._last_context[k] = np.array(default, dtype=np.float32)
+
+    def _update_context(self, info: dict) -> None:
+        for k in self.context_keys:
+            if k in info:
+                self._last_context[k] = np.array(info[k], dtype=np.float32)
+
+    def _build_flat_obs(self, state_int: int) -> np.ndarray:
+        one_hot = np.zeros(self._n_state, dtype=np.float32)
+        one_hot[int(state_int)] = 1.0
+        if not self.context_keys:
+            return one_hot
+        ctx = np.concatenate([self._last_context[k] for k in self.context_keys])
+        return np.concatenate([one_hot, ctx])
+
+    def reset(self, *, seed=None, options=None):
+        self._reset_context()
+        obs, info = self.env.reset(seed=seed, options=options)
+        self._update_context(info)
+        return self._build_flat_obs(obs["state"]), info
+
+    def step(self, action):
+        obs, reward, terminated, truncated, info = self.env.step(action)
+        self._update_context(info)
+        return self._build_flat_obs(obs["state"]), reward, terminated, truncated, info
 
 
 class NoInfoWrapper(GymnasiumWrapper):

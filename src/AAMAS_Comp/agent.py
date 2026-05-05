@@ -1,13 +1,44 @@
 from __future__ import annotations
 from typing import Dict, Optional
 
+import warnings
 import numpy as np
 import torch
 from torch.distributions import Normal
 from tensordict import TensorDict
+
+# torchrl.modules.mcts.scores uses functools.partial in an Enum, which Python
+# 3.13 warns about as a future incompatibility. Suppress before torchrl import.
+warnings.filterwarnings("ignore", category=FutureWarning, module="torchrl")
+
 from torchrl.envs.utils import ExplorationType, set_exploration_type
 
 from AAMAS_Comp.base_agent import ModelFreeAgent, ModelBasedAgent
+
+# ── Numpy MLP forward-pass helper ─────────────────────────────────────────────
+_NP_ACTS = {
+    torch.nn.Tanh: np.tanh,                              # accepts out= natively
+    torch.nn.ReLU: lambda x, out=None: np.maximum(x, 0, out=out),
+}
+
+def _extract_np_layers(seq):
+    """Extract (W, b, act_fn) from an nn.Sequential of Linear+activation layers.
+
+    W is stored transposed (in, out) and C-contiguous so each step is x @ W + b.
+    Raises ValueError on unsupported layer types.
+    """
+    layers = []
+    for m in seq:
+        if isinstance(m, torch.nn.Linear):
+            W = m.weight.detach().numpy().T.copy()  # (in, out), C-contiguous
+            b = m.bias.detach().numpy().copy()
+            layers.append([W, b, None])
+        elif type(m) in _NP_ACTS:
+            if layers:
+                layers[-1][2] = _NP_ACTS[type(m)]
+        else:
+            raise ValueError(f"Unsupported layer type for numpy path: {type(m)}")
+    return [tuple(l) for l in layers]
 
 # ── Official ObGD ─────────────────────────────────────────────────────────────
 # Taken from: https://github.com/mohmdelsayed/streaming-drl/blob/main/optim.py
@@ -82,6 +113,8 @@ def compute_reward_frozenlake(obs_state, grid_size=4):
                else int(obs_state)
     return 1.0 if position == grid_size * grid_size - 1 else 0.0
 
+_DISCRETE_ENVS = {"FrozenLake-v1", "CartPole-v1"}
+
 REWARD_FNS = {
     "Ant-v5":        compute_reward_ant,
     "CartPole-v1":   compute_reward_cartpole,
@@ -102,7 +135,7 @@ class MyModelFreeAgent(ModelFreeAgent):
     def __init__(
         self,
         model_path: str,
-        env_id: str,
+        env_id: str = "",
         device: str = "cpu",
         lam: float            = 0.8,
         gamma: float          = 0.99,
@@ -145,14 +178,95 @@ class MyModelFreeAgent(ModelFreeAgent):
                 )
                 self.online_learning = False
 
+        # ── Fast inference: bypass TorchRL TensorDict dispatch ──────────────
+        # ProbabilisticActor stores modules as ModuleList;
+        # module[0] is the TensorDictModule wrapping the raw nn.Sequential.
+        self._raw_net = self._actor.module[0].module
+        self._is_discrete = (env_id in _DISCRETE_ENVS)
+        self._raw_mlp = None
+        self._raw_npe = None
+        self._npe_bias    = None
+        self._npe_min_val = None
+
+        if not self._is_discrete:
+            try:
+                dkw = self._actor.module[1].distribution_kwargs
+                self._action_low  = dkw["low"].to(self.device)
+                self._action_high = dkw["high"].to(self.device)
+            except Exception:
+                self._action_low  = None
+                self._action_high = None
+
+        # ── Fast inference path selection (fastest → slowest) ────────────────
+        # 1. Numpy matmul: weights extracted once; pure x@W+b per step, no dispatch.
+        # 2. JIT: fallback for unsupported layer types (e.g. LayerNorm).
+        # 3. Raw nn.Sequential: last resort.
+        self._np_layers = None
+        self._np_bufs   = None
+        self._rng       = None
+        self._gumbel_buf       = None
+        self._action_noise_buf = None
+        try:
+            self._np_layers = _extract_np_layers(self._raw_net[0])
+            # One pre-allocated output buffer per layer — eliminates all intermediate allocations.
+            self._np_bufs = [np.empty(b.shape[0], dtype=np.float32) for _, b, _ in self._np_layers]
+            self._rng = np.random.default_rng()
+            if self._is_discrete:
+                n_actions = self._np_layers[-1][1].shape[0]
+                self._gumbel_buf = np.empty(n_actions, dtype=np.float32)
+            else:
+                act_dim = self._np_layers[-1][1].shape[0] // 2
+                self._action_noise_buf = np.empty(act_dim, dtype=np.float32)
+                bs = self._raw_net[1].scale_mapping
+                self._npe_bias    = float(bs.bias)
+                self._npe_min_val = float(bs.min_val)
+        except Exception:
+            if self._is_discrete:
+                try:
+                    self._raw_net = torch.jit.optimize_for_inference(
+                        torch.jit.script(self._raw_net))
+                except Exception:
+                    pass
+            else:
+                try:
+                    self._raw_mlp = torch.jit.optimize_for_inference(
+                        torch.jit.script(self._raw_net[0]))
+                    self._raw_npe = self._raw_net[1]
+                except Exception:
+                    pass
+
         # ── Obs normalisation ────────────────────────────────────────────────
         obs_rms = ckpt.get("obs_rms", None)
         if obs_rms is not None:
-            self._obs_mean = obs_rms["mean"].to(self.device).float()
-            self._obs_std  = obs_rms["std"].to(self.device).float()
+            self._obs_mean    = obs_rms["mean"].to(self.device).float()
+            self._obs_std     = obs_rms["std"].to(self.device).float()
+            self._obs_std_eps = self._obs_std + 1e-8   # pre-computed, avoids per-step kernel
+            self._has_obs_norm = True
         else:
-            self._obs_mean = None
-            self._obs_std  = None
+            self._obs_mean     = None
+            self._obs_std      = None
+            self._obs_std_eps  = None
+            self._has_obs_norm = False
+
+        # ── Numpy fast path: obs buffer + optional norm folding ─────────────
+        # Pre-allocate a float32 obs buffer so get_action can bypass torch entirely.
+        # When obs norm is present and online_learning=False, fold (x-mean)/std into
+        # the first layer's weights so normalisation costs zero at inference time:
+        #   h = ((x - mean) / std) @ W + b  =  x @ W' + b'
+        #   W' = W / std[:,None],  b' = b - (mean/std) @ W
+        self._obs_buf = None
+        self._np_norm_folded = False
+        if self._np_layers is not None:
+            obs_dim_val = self._np_layers[0][0].shape[0]
+            self._obs_buf = np.empty(obs_dim_val, dtype=np.float32)
+            if self._has_obs_norm and not self.online_learning:
+                std_eps = self._obs_std_eps.numpy()        # float32 (obs_dim,)
+                mean    = self._obs_mean.numpy()           # float32 (obs_dim,)
+                W0, b0, act0 = self._np_layers[0]
+                W0_new = np.ascontiguousarray((W0 / std_eps[:, None]).astype(np.float32))
+                b0_new = (b0 - (mean / std_eps) @ W0).astype(np.float32)
+                self._np_layers[0] = (W0_new, b0_new, act0)
+                self._np_norm_folded = True
 
         # ── EWC: freeze θ* and Fisher ────────────────────────────────────────
         if self.use_ewc:
@@ -178,15 +292,66 @@ class MyModelFreeAgent(ModelFreeAgent):
                 lr=lr, gamma=gamma, lamda=lam, kappa=kappa_v,
             )
 
+        # ── Context features (for inference-time obs reconstruction) ─────────
+        _ctx = ckpt.get("context_meta", {})
+        self._ctx_keys: list[str]       = _ctx.get("context_keys", [])
+        self._ctx_defaults: dict        = _ctx.get("context_defaults", {})
+        self._n_state: int | None       = _ctx.get("n_state", None)
+        # Fallback for old checkpoints without context_meta: infer obs dim from
+        # the actor's first Linear layer so _prepare_obs can still one-hot encode.
+        if self._n_state is None and self.env_id in _DISCRETE_ENVS:
+            try:
+                first_linear = next(
+                    m for m in self._actor.modules()
+                    if isinstance(m, torch.nn.Linear)
+                )
+                self._n_state = first_linear.in_features
+            except StopIteration:
+                pass
+        # Current context cache — updated via update_context(info) in evaluator
+        self._last_context: dict[str, np.ndarray] = {
+            k: np.array(self._ctx_defaults.get(k, [0.0]), dtype=np.float32)
+            for k in self._ctx_keys
+        }
+
         # ── Transition cache ─────────────────────────────────────────────────
         self._prev_state:  Optional[torch.Tensor] = None
         self._prev_action: Optional[torch.Tensor] = None
         self._prev_relative_time = None
 
+    def update_context(self, info: dict) -> None:
+        """Cache context values from a step's info dict.
+
+        Call this in the evaluator loop after env.step() so the next
+        get_action() call uses the latest transition probability.
+        At competition time (info not passed), the cache retains defaults.
+        """
+        for k in self._ctx_keys:
+            if k in info:
+                self._last_context[k] = np.array(info[k], dtype=np.float32)
+
+    def _prepare_obs(self, raw_state) -> np.ndarray:
+        """Build the flat obs vector the network expects.
+
+        - Flat array (training/local-eval via ContextFlatWrapper): return as-is.
+        - Dict obs (competition eval): one-hot encode + append cached context.
+        """
+        if isinstance(raw_state, np.ndarray) and raw_state.ndim >= 1:
+            return raw_state  # already flat from ContextFlatWrapper
+        # Discrete int obs: one-hot encode then append context
+        if self._n_state is not None:
+            one_hot = np.zeros(self._n_state, dtype=np.float32)
+            one_hot[int(raw_state)] = 1.0
+            if self._ctx_keys:
+                ctx = np.concatenate([self._last_context[k] for k in self._ctx_keys])
+                return np.concatenate([one_hot, ctx])
+            return one_hot
+        return np.array(raw_state, dtype=np.float32)
+
     def _normalise(self, state: np.ndarray) -> torch.Tensor:
         s = torch.as_tensor(state, dtype=torch.float32, device=self.device)
-        if self._obs_mean is not None and self._obs_mean.shape == s.shape:
-            s = (s - self._obs_mean) / (self._obs_std + 1e-8)
+        if self._has_obs_norm:
+            s = s.sub_(self._obs_mean).div_(self._obs_std_eps)
         return s
 
     def _compute_reward(self, state, prev_state, action):
@@ -294,7 +459,7 @@ class MyModelFreeAgent(ModelFreeAgent):
 
 
     def get_action(self, obs: Dict) -> np.ndarray:
-        raw_state  = obs["state"]        if isinstance(obs, dict) else obs
+        raw_state     = obs["state"] if isinstance(obs, dict) else obs
         relative_time = obs.get("relative_time", None) if isinstance(obs, dict) else None
 
         # Episodes is finished if the relative time resets back to 0
@@ -304,7 +469,15 @@ class MyModelFreeAgent(ModelFreeAgent):
             and relative_time < self._prev_relative_time
         )
         self._prev_relative_time = relative_time
-        s = self._normalise(raw_state)
+
+        # Fast path (eval only): bypass torch entirely when numpy matmul is active.
+        # np.copyto handles float64→float32 without allocating; norm is pre-folded
+        # into the first layer's weights so _normalise is not needed.
+        if self._obs_buf is not None and not self.online_learning:
+            np.copyto(self._obs_buf, self._prepare_obs(raw_state), casting='unsafe')
+            return self._sample_action_np(self._obs_buf)
+
+        s = self._normalise(self._prepare_obs(raw_state))
 
         if self.online_learning and self._prev_state is not None:
             r = self._compute_reward(
@@ -332,14 +505,98 @@ class MyModelFreeAgent(ModelFreeAgent):
         ).detach()
         return action
 
+    def _sample_action_np(self, x: np.ndarray) -> np.ndarray:
+        """Fast eval path: x is already float32 numpy with norm pre-folded into weights."""
+        for (W, b, act), buf in zip(self._np_layers, self._np_bufs):
+            np.dot(x, W, out=buf)
+            buf += b
+            if act is not None:
+                act(buf, out=buf)
+            x = buf
+        if self._is_discrete:
+            if self.deterministic:
+                return int(x.argmax())
+            self._rng.standard_exponential(out=self._gumbel_buf, dtype=np.float32)
+            np.log(self._gumbel_buf, out=self._gumbel_buf)
+            np.subtract(x, self._gumbel_buf, out=self._gumbel_buf)
+            return int(self._gumbel_buf.argmax())
+        act_dim = x.shape[0] // 2
+        loc   = x[:act_dim]
+        scale = np.logaddexp(0.0, x[act_dim:] + self._npe_bias) + self._npe_min_val
+        if self.deterministic:
+            return np.tanh(loc)
+        self._rng.standard_normal(out=self._action_noise_buf, dtype=np.float32)
+        self._action_noise_buf *= scale
+        self._action_noise_buf += loc
+        np.tanh(self._action_noise_buf, out=self._action_noise_buf)
+        if self._action_low is not None:
+            lo = self._action_low.numpy()
+            hi = self._action_high.numpy()
+            return lo + (self._action_noise_buf + 1.0) * 0.5 * (hi - lo)
+        return self._action_noise_buf
+
     def _sample_action(self, s: torch.Tensor) -> np.ndarray:
-        td = TensorDict({"observation": s.unsqueeze(0)}, batch_size=[1],
-                        device=self.device)
-        explore = ExplorationType.DETERMINISTIC if self.deterministic \
-                else ExplorationType.RANDOM
-        with set_exploration_type(explore), torch.no_grad():
-            td = self._actor(td)
-        return td["action"].squeeze(0).cpu().numpy()
+        if self._np_layers is not None:
+            x = s.numpy()  # (obs_dim,) — zero-copy, safe because _normalise always copies
+            for (W, b, act), buf in zip(self._np_layers, self._np_bufs):
+                np.dot(x, W, out=buf)
+                buf += b
+                if act is not None:
+                    act(buf, out=buf)
+                x = buf
+            # x is now self._np_bufs[-1]: logits (discrete) or raw (continuous)
+            if self._is_discrete:
+                if self.deterministic:
+                    return int(x.argmax())
+                # Gumbel-max: argmax(logits - log(Exp(1))), all in pre-allocated buffer
+                self._rng.standard_exponential(out=self._gumbel_buf, dtype=np.float32)
+                np.log(self._gumbel_buf, out=self._gumbel_buf)
+                np.subtract(x, self._gumbel_buf, out=self._gumbel_buf)
+                return int(self._gumbel_buf.argmax())
+            act_dim = x.shape[0] // 2
+            loc   = x[:act_dim]
+            scale = np.logaddexp(0.0, x[act_dim:] + self._npe_bias) + self._npe_min_val
+            if self.deterministic:
+                action = np.tanh(loc)
+            else:
+                self._rng.standard_normal(out=self._action_noise_buf, dtype=np.float32)
+                self._action_noise_buf *= scale
+                self._action_noise_buf += loc
+                np.tanh(self._action_noise_buf, out=self._action_noise_buf)
+                action = self._action_noise_buf
+            if self._action_low is not None:
+                lo = self._action_low.numpy()
+                hi = self._action_high.numpy()
+                action = lo + (action + 1.0) * 0.5 * (hi - lo)
+            return action
+
+        # ── JIT / raw fallback ────────────────────────────────────────────────
+        obs = s.unsqueeze(0)
+        with torch.no_grad():
+            if self._raw_mlp is not None:
+                net_out = self._raw_npe(self._raw_mlp(obs))
+            else:
+                net_out = self._raw_net(obs)
+
+        if self._is_discrete:
+            logits = net_out.squeeze(0)
+            if self.deterministic:
+                return int(logits.argmax().item())
+            noise = torch.empty_like(logits).exponential_().log_().neg_()
+            return int((logits + noise).argmax().item())
+
+        loc, scale = net_out
+        loc   = loc.squeeze(0)
+        scale = scale.squeeze(0)
+        if self.deterministic:
+            raw = loc.tanh()
+        else:
+            raw = (loc + scale * torch.randn_like(loc)).tanh()
+        if self._action_low is not None:
+            action = self._action_low + (raw + 1.0) * 0.5 * (self._action_high - self._action_low)
+        else:
+            action = raw
+        return action.cpu().numpy()
 
     def set_seed(self, seed: int):
         torch.manual_seed(seed)

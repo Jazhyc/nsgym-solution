@@ -14,8 +14,8 @@ from submission import get_agent
 
 #Add additional envionments here or comment out the ones you do not want to evaluate. 
 ENVIRONMENTS = {
-    # "ExampleNSFrozenLake-v0": "FrozenLake-v1",
-    # "ExampleNSCartPole-v0": "CartPole-v1",
+    "ExampleNSFrozenLake-v0": "FrozenLake-v1",
+    "ExampleNSCartPole-v0": "CartPole-v1",
     "ExampleNSAnt-v0": "Ant-v5",
 }
 
@@ -34,7 +34,7 @@ def evaluate_local(num_episodes=10, start_seed=42):
     for env_id, base_env_id in ENVIRONMENTS.items():
         for change_notification, delta_change_notification, notify_label in NOTIFICATIONS:
 
-            agent = get_agent(base_env_id)
+            agent = get_agent(base_env_id, notify_label)
             env = gym.make(
                 env_id,
                 change_notification=change_notification,

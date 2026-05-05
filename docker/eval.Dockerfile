@@ -4,6 +4,7 @@ FROM ns-gym-base
 # ---- Add custom dependencies below this line ----
 # System packages:  RUN apt-get update && apt-get install -y <package>
 # Python packages:  RUN uv pip install <package>
+RUN uv pip install tensordict
 
 COPY src/ ./src/
 RUN uv pip install -e . --no-deps

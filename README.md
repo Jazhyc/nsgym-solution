@@ -139,13 +139,41 @@ Logged metrics include `train/reward_mean`, `train/kl_approx`, `train/clip_fract
 
 ## Checkpoints
 
-Checkpoints are saved to `checkpoints/` at the interval set by `training.save_interval` (default: every 10 000 collector iterations) and as `checkpoints/ppo_final.pt` at the end of training.
+Training writes checkpoints to `checkpoints/` by default. When you have a run you trust, promote the final artifact into the tracked model slot:
 
-Load a saved model:
-
-```python
-from AAMAS_Comp.agents.ppo import PPOAgent
-
-agent = PPOAgent.load("checkpoints/ppo_final.pt", device="cpu")
-action = agent.get_action({"state": obs})
+```bash
+cp checkpoints/ppo_final.pt models/ppo_ant/ppo_final.pt
 ```
+
+Checkpoints include observation running statistics — no separate normalizer file needed.
+
+## Local Evaluation
+
+Run against all three competition environments:
+
+```bash
+python evaluator.py --num-episodes 10 --start-seed 42
+```
+
+Results are written to `results/<env>__<notify_level>/summary.json`. Key metric: `iqm_total_reward`.
+
+## Submission (Docker)
+
+The competition evaluates inside a `linux/amd64` Docker container. Test your submission locally before submitting:
+
+```bash
+docker compose build              # first time, or after changing pyproject.toml / eval.Dockerfile
+docker compose run test-submission  # runs evaluator.py inside the container
+```
+
+`submission.py`, `src/`, `models/`, and `evaluator.py` are mounted as volumes — code and weight changes are picked up without rebuilding. Only re-run `docker compose build` after modifying Python/system dependencies.
+
+### Submission Checklist
+
+1. `submission.py` — `get_agent(env_id, notify)` wired up for all three environments
+2. Model weights committed to `models/` (Ant, CartPole, FrozenLake)
+3. Extra Python deps in `pyproject.toml` (`uv add <package>`); system deps in `docker/eval.Dockerfile`
+4. `docker compose build` — build the images (re-run after any dep changes)
+5. `docker compose run test-submission` passes without errors
+6. Add competition organizers ([nkepling](https://github.com/nkepling), [ayanmukhopadhyay](https://github.com/ayanmukhopadhyay)) as repo collaborators
+7. [Open an issue](https://github.com/scope-lab-vu/ns-gym-comp-template/issues/new) on the template repo with a link to this repo
