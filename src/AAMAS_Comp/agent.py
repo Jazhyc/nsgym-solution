@@ -106,13 +106,13 @@ class MyModelFreeAgent(ModelFreeAgent):
         device: str = "cpu",
         lam: float            = 0.8,
         gamma: float          = 0.99,
-        lr: float             = 1.0, # 1.0,
+        lr: float             = 1.0,
         kappa_pi: float       = 3.0,
         kappa_v: float        = 2.0,
         entropy_coeff: float  = 0.01,
         use_ewc: bool         = True,
         ewc_lambda: float     = 500.0,
-        online_learning: bool = True,
+        online_learning: bool = False,
         deterministic: bool   = False,
     ):
         super().__init__()
