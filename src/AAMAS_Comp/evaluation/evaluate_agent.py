@@ -30,7 +30,13 @@ def run_single_episode(env, agent, seed):
         dict: A dictionary containing lists of rewards, observations, actions, and decision times.
     """
 
-    obs, reward = env.reset(seed=seed)
+    obs, reset_info = env.reset(seed=seed)
+
+    # Seed context-aware agents with the initial transition distribution.
+    # NSFrozenLakeWrapper omits transition_prob from reset info, so this is a
+    # no-op for most envs, but any wrapper that does include it will work.
+    if hasattr(agent, "update_context"):
+        agent.update_context(reset_info)
 
     done = False
     truncated = False

@@ -32,7 +32,7 @@ from __future__ import annotations
 
 import numpy as np
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Callable
 
 import gymnasium as gym
 
@@ -192,12 +192,14 @@ class NSEnvSampler:
         param_specs: list[ParamSpec],
         gym_kwargs: dict[str, Any] | None = None,
         wrapper_kwargs: dict[str, Any] | None = None,
+        wrapper_kwargs_sampler: Callable[[np.random.Generator], dict] | None = None,
         seed: int | None = None,
     ):
         self.env_id = env_id
         self.param_specs = param_specs
         self.gym_kwargs = gym_kwargs or {}
         self.wrapper_kwargs = wrapper_kwargs or {}
+        self.wrapper_kwargs_sampler = wrapper_kwargs_sampler
         self.rng = np.random.default_rng(seed)
 
     def _sample_kwargs(self, ranges: dict) -> dict:
@@ -239,11 +241,15 @@ class NSEnvSampler:
         if not tunable_params:
             return self.sample()
 
+        wrapper_kwargs = {**self.wrapper_kwargs}
+        if self.wrapper_kwargs_sampler is not None:
+            wrapper_kwargs.update(self.wrapper_kwargs_sampler(self.rng))
+
         return NSEnvConfig(
             env_id=self.env_id,
             tunable_params=tunable_params,
             gym_kwargs=self.gym_kwargs,
-            wrapper_kwargs=self.wrapper_kwargs,
+            wrapper_kwargs=wrapper_kwargs,
         )
 
     def mutate(
@@ -292,11 +298,15 @@ class NSEnvSampler:
                 ),
             )
 
+        wrapper_kwargs = {**config.wrapper_kwargs}
+        if self.wrapper_kwargs_sampler is not None:
+            wrapper_kwargs.update(self.wrapper_kwargs_sampler(rng))
+
         return NSEnvConfig(
             env_id=config.env_id,
             tunable_params=new_tunable,
             gym_kwargs=config.gym_kwargs,
-            wrapper_kwargs=config.wrapper_kwargs,
+            wrapper_kwargs=wrapper_kwargs,
         )
 
     def make(self, config: NSEnvConfig | None = None) -> gym.Env:
@@ -385,19 +395,64 @@ CARTPOLE_PARAM_SPECS: list[ParamSpec] = [
             "OrnsteinUhlenbeck", "BoundedRandomWalk",
         ],
         update_fn_overrides={
-            # Pole mass starts at 0.1 kg; keep mass positive
+            # Pole mass starts at 0.1 kg; competition uses k=0.1 (unbounded drift)
+            # so allow up to 0.1 here to cover that regime
+            "IncrementUpdate":   {"k":     (0.001, 0.1)},
             "DecrementUpdate":   {"k":     (0.00001, 0.001)},
             "ExponentialDecay":  {"decay_rate": (1e-6, 1e-4)},
             "OrnsteinUhlenbeck": {"theta": (0.001, 0.1),
                                   "mu":    (0.05, 1.0),
                                   "sigma": (0.001, 0.05)},
-            # lo < hi guaranteed: lo ∈ (0.01, 0.05), hi ∈ (0.3, 2.0)
+            # lo < hi guaranteed: lo ∈ (0.01, 0.05), hi ∈ (1.0, 5.0)
             "BoundedRandomWalk": {"mu":    (0.0, 0.0),
                                   "sigma": (0.005, 0.05),
                                   "lo":    (0.01, 0.05),
-                                  "hi":    (0.3, 2.0)},
+                                  "hi":    (1.0, 5.0)},
         },
         required=True,
+    ),
+    ParamSpec(
+        param_name="length",
+        schedulers=_ALL_SCHEDULERS,
+        update_fns=[
+            "IncrementUpdate", "DecrementUpdate", "RandomWalk",
+            "OrnsteinUhlenbeck", "BoundedRandomWalk",
+        ],
+        update_fn_overrides={
+            # Pole length default 0.5 m; shorter poles are much harder to balance
+            "DecrementUpdate":   {"k":     (0.00001, 0.001)},
+            "OrnsteinUhlenbeck": {"theta": (0.001, 0.1),
+                                  "mu":    (0.2, 0.8),
+                                  "sigma": (0.001, 0.05)},
+            # lo < hi guaranteed: lo ∈ (0.1, 0.3), hi ∈ (0.5, 1.0)
+            "BoundedRandomWalk": {"mu":    (0.0, 0.0),
+                                  "sigma": (0.005, 0.05),
+                                  "lo":    (0.1, 0.3),
+                                  "hi":    (0.5, 1.0)},
+        },
+        required=True,
+    ),
+    ParamSpec(
+        param_name="masscart",
+        schedulers=_ALL_SCHEDULERS,
+        update_fns=[
+            "IncrementUpdate", "DecrementUpdate", "RandomWalk",
+            "OrnsteinUhlenbeck", "BoundedRandomWalk",
+        ],
+        update_fn_overrides={
+            # Cart mass default 1.0 kg; keep positive
+            "DecrementUpdate":   {"k":     (0.0001, 0.005)},
+            "OrnsteinUhlenbeck": {"theta": (0.001, 0.1),
+                                  "mu":    (0.5, 3.0),
+                                  "sigma": (0.01, 0.1)},
+            # lo < hi guaranteed: lo ∈ (0.1, 0.5), hi ∈ (2.0, 5.0)
+            "BoundedRandomWalk": {"mu":    (0.0, 0.0),
+                                  "sigma": (0.01, 0.1),
+                                  "lo":    (0.1, 0.5),
+                                  "hi":    (2.0, 5.0)},
+        },
+        required=False,
+        include_prob=0.6,
     ),
     ParamSpec(
         param_name="gravity",
@@ -442,6 +497,22 @@ FROZENLAKE_PARAM_SPECS: list[ParamSpec] = [
 # Named sampler catalogue
 # ---------------------------------------------------------------------------
 
+def _sample_frozenlake_wrapper_kwargs(rng: np.random.Generator) -> dict:
+    """Sample a starting distribution with uniform p_straight coverage.
+
+    Samples p_straight ~ Uniform[0,1] directly, then distributes the remainder
+    between p_left and p_right uniformly. This gives:
+      - P(p_straight > 0.5) = 50%  (vs 26% for Dirichlet([2,2,2]))
+      - P(p_straight > 0.9) = 10%  (vs  0.4% for Dirichlet([2,2,2]))
+    Ensures the agent trains on the full range from near-deterministic to
+    fully slippery, matching the competition env's decay trajectory.
+    """
+    p_straight = rng.uniform(0.0, 1.0)
+    p_left = rng.uniform(0.0, 1.0 - p_straight)
+    p_right = 1.0 - p_straight - p_left
+    return {"initial_prob_dist": [float(p_straight), float(p_left), float(p_right)]}
+
+
 NS_ENV_SAMPLERS: dict[str, callable] = {
     "ant": lambda seed=None: NSEnvSampler(
         env_id="Ant-v5",
@@ -461,7 +532,7 @@ NS_ENV_SAMPLERS: dict[str, callable] = {
         env_id="FrozenLake-v1",
         param_specs=FROZENLAKE_PARAM_SPECS,
         gym_kwargs={"disable_env_checker": True},
-        wrapper_kwargs={"initial_prob_dist": [1/3, 1/3, 1/3]},
+        wrapper_kwargs_sampler=_sample_frozenlake_wrapper_kwargs,
         seed=seed,
     ),
 }

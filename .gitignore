@@ -219,3 +219,5 @@ checkpoints/*/*.pt
 !models/
 .vscode
 .serena/
+# LaTeX report lives in its own Overleaf-synced git repo
+report/
