@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Any
 
 import numpy as np
+from AAMAS_Comp.evaluation.statistics import trimmed_mean
 
 
 def json_default(obj: Any) -> Any:
@@ -53,9 +54,7 @@ def build_summary(results_table: dict[str, dict[str, Any]]) -> dict[str, Any]:
         dtype=float,
     )
 
-    q1, q3 = np.percentile(all_rewards, [25, 75])
-    iqm_rewards = all_rewards[(all_rewards >= q1) & (all_rewards <= q3)]
-    iqm_total_reward = float(np.mean(iqm_rewards)) if len(iqm_rewards) > 0 else float(np.mean(all_rewards))
+    iqm_total_reward = trimmed_mean(all_rewards)
 
     aggregate = {
         "mean_total_reward": float(np.mean(all_rewards)),

@@ -10,10 +10,12 @@ import logging
 from functools import partial
 
 import gymnasium as gym
+import numpy as np
 import torch
 from omegaconf import DictConfig
 
-from torchrl.data import OneHot, UnboundedContinuous
+from torchrl.data import OneHot, UnboundedContinuous, Unbounded
+from torchrl.envs.gym_like import default_info_dict_reader
 from torchrl.envs import (
     CatFrames,
     Compose,
@@ -27,7 +29,12 @@ from torchrl.envs.transforms import Transform
 from torchrl.envs.libs.gym import GymWrapper
 
 from AAMAS_Comp.curriculum import PLREnv, FixedNSEnv, RandomNSEnv, sample_held_out_configs
-from AAMAS_Comp.envs.wrappers import NoInfoWrapper, RunningMeanStd
+from AAMAS_Comp.envs.wrappers import NoInfoWrapper, RunningMeanStd, SeededResetWrapper
+from AAMAS_Comp.curriculum.feedback import PLR_KEYS
+
+
+def worker_seed(seed, worker_idx=0, stream=0):
+    return int(np.random.SeedSequence([int(seed), int(worker_idx), int(stream)]).generate_state(1)[0])
 
 log = logging.getLogger(__name__)
 
@@ -73,7 +80,9 @@ def initialize_obs_norm(
         return None
 
     log.info("Bootstrapping observation normalization stats...")
-    base_env = GymWrapper(NoInfoWrapper(gym.make(cfg.env.id)), device=device)
+    base_env = GymWrapper(NoInfoWrapper(SeededResetWrapper(gym.make(cfg.env.id),
+                           worker_seed(cfg.seed, stream=10))), device=device)
+    base_env.set_seed(worker_seed(cfg.seed, stream=10))
     tmp = TransformedEnv(base_env, Compose(DoubleToFloat(), StepCounter()))
     tmp.reset()
     td = tmp.rollout(max_steps=cfg.env.normalize_obs_init_steps, break_when_any_done=False)
@@ -97,6 +106,7 @@ def _make_env_transforms(
     base_env,
     obs_rms: RunningMeanStd | None,
     frame_stack: int = 1,
+    max_steps: int | None = None,
 ) -> list:
     """Return the TorchRL transform list appropriate for this env."""
     transforms = []
@@ -109,7 +119,7 @@ def _make_env_transforms(
         obs_norm.scale = torch.nn.Parameter(obs_rms.std.float().clone(), requires_grad=False)
         transforms.append(obs_norm)
     transforms.append(DoubleToFloat())
-    transforms.append(StepCounter())
+    transforms.append(StepCounter(max_steps=max_steps))
     if frame_stack > 1:
         transforms.append(CatFrames(N=frame_stack, dim=-1, in_keys=["observation"]))
     return transforms
@@ -120,11 +130,14 @@ def make_single_env(
     device: torch.device,
     obs_rms: RunningMeanStd | None = None,
     dtype: torch.dtype | None = None,
+    worker_idx: int = 0,
 ) -> TransformedEnv:
     """Create a single TorchRL TransformedEnv instance."""
     frame_stack = cfg.env.get("frame_stack", 1)
-    base_env = GymWrapper(NoInfoWrapper(gym.make(cfg.env.id)), device=device)
-    return TransformedEnv(base_env, Compose(*_make_env_transforms(base_env, obs_rms, frame_stack)))
+    base_env = GymWrapper(NoInfoWrapper(SeededResetWrapper(gym.make(cfg.env.id),
+                           worker_seed(cfg.seed, worker_idx, 1))), device=device)
+    return TransformedEnv(base_env, Compose(*_make_env_transforms(
+        base_env, obs_rms, frame_stack, cfg.collector.max_frames_per_traj)))
 
 
 def make_parallel_env(
@@ -160,6 +173,7 @@ def make_ns_plr_env(
     stats_queue=None,
     worker_idx: int = 0,
     score_array=None,
+    feedback_queue=None,
 ) -> TransformedEnv:
     """Create a PLREnv-backed TorchRL TransformedEnv for NS training.
 
@@ -177,15 +191,20 @@ def make_ns_plr_env(
         mutation_sigma=plr_cfg.get("mutation_sigma", 0.2),
         score_temp=plr_cfg.score_temp,
         staleness_coef=plr_cfg.staleness_coef,
-        seed=None,  # OS entropy so each worker explores different configs
+        seed=worker_seed(cfg.seed, worker_idx, 2),
         stats_queue=stats_queue,
         worker_idx=worker_idx,
         score_array=score_array,
+        feedback_queue=feedback_queue,
         context_keys=context_keys,
         context_defaults=context_defaults,
     )
-    base_env = GymWrapper(NoInfoWrapper(plr_env), device=device)
-    return TransformedEnv(base_env, Compose(*_make_env_transforms(base_env, obs_rms, frame_stack)))
+    base_env = GymWrapper(NoInfoWrapper(SeededResetWrapper(plr_env,
+                           worker_seed(cfg.seed, worker_idx, 1)), keep_keys=PLR_KEYS), device=device)
+    base_env.set_info_dict_reader(default_info_dict_reader(
+        keys=list(PLR_KEYS), spec={k: Unbounded(shape=(), dtype=torch.int64) for k in PLR_KEYS}))
+    return TransformedEnv(base_env, Compose(*_make_env_transforms(
+        base_env, obs_rms, frame_stack, cfg.collector.max_frames_per_traj)))
 
 
 def make_ns_random_env(
@@ -193,6 +212,7 @@ def make_ns_random_env(
     device: torch.device,
     obs_rms: RunningMeanStd | None = None,
     dtype: torch.dtype | None = None,
+    worker_idx: int = 0,
 ) -> TransformedEnv:
     """Create a randomly-sampled NS env (no PLR) for NS baseline training.
 
@@ -205,12 +225,27 @@ def make_ns_random_env(
     context_keys, context_defaults = _get_context_cfg(cfg)
     random_env = RandomNSEnv(
         sampler_key=plr_cfg.sampler_key,
-        seed=None,
+        seed=worker_seed(cfg.seed, worker_idx, 2),
         context_keys=context_keys,
         context_defaults=context_defaults,
     )
-    base_env = GymWrapper(NoInfoWrapper(random_env), device=device)
-    return TransformedEnv(base_env, Compose(*_make_env_transforms(base_env, obs_rms, frame_stack)))
+    base_env = GymWrapper(NoInfoWrapper(SeededResetWrapper(random_env,
+                           worker_seed(cfg.seed, worker_idx, 1))), device=device)
+    return TransformedEnv(base_env, Compose(*_make_env_transforms(
+        base_env, obs_rms, frame_stack, cfg.collector.max_frames_per_traj)))
+
+
+def make_static_dr_env(cfg, device, obs_rms=None, dtype=None, worker_idx=0):
+    import json
+    from AAMAS_Comp.envs.domain_randomization import DynamicsEnv
+    from pathlib import Path
+    definition = json.loads(Path(cfg.experiment.manifest).read_text())["tasks"][cfg.env.plr.sampler_key]
+    env = DynamicsEnv(cfg.env.plr.sampler_key, definition["dr_ranges"],
+                      seed=worker_seed(cfg.seed, worker_idx, 2), samples=definition["dr_samples"])
+    base_env = GymWrapper(NoInfoWrapper(SeededResetWrapper(env,
+                           worker_seed(cfg.seed, worker_idx, 1))), device=device)
+    return TransformedEnv(base_env, Compose(*_make_env_transforms(
+        base_env, obs_rms, cfg.env.frame_stack, cfg.collector.max_frames_per_traj)))
 
 
 def make_fixed_ns_eval_env(
@@ -219,13 +254,15 @@ def make_fixed_ns_eval_env(
     device: torch.device,
     obs_rms: RunningMeanStd | None = None,
     dtype: torch.dtype | None = None,
+    rollout_seed: int = 0,
 ) -> TransformedEnv:
     """Create a fixed-config NS env for held-out evaluation."""
     frame_stack = cfg.env.get("frame_stack", 1)
     context_keys, context_defaults = _get_context_cfg(cfg)
     fixed_env = FixedNSEnv(config, context_keys=context_keys, context_defaults=context_defaults)
-    base_env = GymWrapper(NoInfoWrapper(fixed_env), device=device)
-    return TransformedEnv(base_env, Compose(*_make_env_transforms(base_env, obs_rms, frame_stack)))
+    base_env = GymWrapper(NoInfoWrapper(SeededResetWrapper(fixed_env, rollout_seed)), device=device)
+    return TransformedEnv(base_env, Compose(*_make_env_transforms(
+        base_env, obs_rms, frame_stack, cfg.collector.max_frames_per_traj)))
 
 
 def make_ns_eval_shards(
@@ -257,7 +294,8 @@ def make_ns_eval_shards(
     for start in range(0, len(held_out), batch_size):
         shard_configs = held_out[start : start + batch_size]
         shards.append([
-            partial(make_fixed_ns_eval_env, c, cfg, device, obs_rms, dtype)
-            for c in shard_configs
+            partial(make_fixed_ns_eval_env, c, cfg, device, obs_rms, dtype,
+                    worker_seed(plr_cfg.eval_seed, start + i, 3))
+            for i, c in enumerate(shard_configs)
         ])
     return shards

@@ -221,3 +221,4 @@ checkpoints/*/*.pt
 .serena/
 # LaTeX report lives in its own Overleaf-synced git repo
 report/
+*.sbatch

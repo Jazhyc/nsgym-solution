@@ -186,13 +186,36 @@ class NoInfoWrapper(GymnasiumWrapper):
     components, position/velocity diagnostics) from being serialized over IPC
     on every environment step."""
 
+    def __init__(self, env, keep_keys=()):
+        super().__init__(env)
+        self.keep_keys = keep_keys
+
     def step(self, action):
         obs, reward, terminated, truncated, _info = self.env.step(action)
-        return obs, reward, terminated, truncated, {}
+        return obs, reward, terminated, truncated, {k: _info[k] for k in self.keep_keys}
 
     def reset(self, **kwargs):
         obs, _info = self.env.reset(**kwargs)
-        return obs, {}
+        return obs, {k: _info[k] for k in self.keep_keys}
+
+
+class SeededResetWrapper(GymnasiumWrapper):
+    """Independent, reproducible simulator and NS-function seeds per episode."""
+
+    def __init__(self, env, seed):
+        super().__init__(env)
+        self.rng = np.random.default_rng(seed)
+
+    def reset(self, *, seed=None, options=None):
+        import random
+        episode_seed = int(self.rng.integers(0, 2**31)) if seed is None else int(seed)
+        np.random.seed(episode_seed)
+        random.seed(episode_seed)
+        self.action_space.seed(episode_seed)
+        result = self.env.reset(seed=episode_seed, options=options)
+        from AAMAS_Comp.envs.domain_randomization import seed_update_functions
+        seed_update_functions(self.env, episode_seed)
+        return result
 
 
 class RunningMeanStd:

@@ -2,9 +2,8 @@
 PLREnv — gymnasium wrapper that embeds a PLRBuffer.
 
 On every reset():
-  1. Scores the previous episode using mean |advantage| written by the main
-     process after GAE (correct learning-potential signal).  Falls back to
-     episode return if the score array hasn't been populated yet (first batch).
+  1. Applies delayed, episode-specific mean |advantage| feedback from the
+     learner. Replaced level generations reject stale feedback.
   2. Calls plr.update() to update the buffer.
   3. Samples the next config from the buffer.
   4. Rebuilds the underlying NS env from that config.
@@ -13,16 +12,18 @@ Env-family dispatch:
   - CartPole-family: FastNSClassicControlWrapper (low overhead, raw numpy obs).
   - MuJoCo / FrozenLake: NSEnvFactory.make() (stock NS wrappers).
 
-Each instance is fully self-contained — no shared state between workers.
-TorchRL's ParallelEnv can safely spawn one per subprocess.
+Each instance owns its buffer and feedback queue. TorchRL's ParallelEnv can
+safely spawn one per subprocess; no score slots are shared between groups.
 """
 
 from __future__ import annotations
 
 from copy import deepcopy
+from queue import Empty
 from typing import Any
 
 import gymnasium as gym
+import numpy as np
 
 from AAMAS_Comp.envs.ns_env_factory import NSEnvConfig, NSEnvFactory
 from AAMAS_Comp.envs.fast_ns_wrapper import FastNSClassicControlWrapper
@@ -99,9 +100,8 @@ def _build_ns_env(
 class PLREnv(gym.Env):
     """Gymnasium env that rotates NS configs via PLR on every reset().
 
-    Each subprocess worker owns an independent PLRBuffer — no IPC needed.
-    Episode return is used as the PLR score proxy (TD-error scoring requires
-    critic values which are not available inside the env).
+    Each worker owns a buffer. The training path receives scored episode IDs
+    through its feedback queue; legacy callers without feedback use return.
 
     Args:
         sampler_key:    Key into NS_ENV_SAMPLERS ("cartpole", "ant", "frozenlake").
@@ -130,6 +130,7 @@ class PLREnv(gym.Env):
         stats_queue=None,
         worker_idx: int = 0,
         score_array=None,
+        feedback_queue=None,
         context_keys: list[str] | None = None,
         context_defaults: dict | None = None,
     ) -> None:
@@ -153,23 +154,38 @@ class PLREnv(gym.Env):
         self._stats_queue = stats_queue
         self._worker_idx: int = worker_idx
         self._score_array = score_array
+        self._feedback_queue = feedback_queue
+        self._level_tokens = {}
+        self._token_counter = 0
+        self._applied_scores = 0
+        self._discarded_scores = 0
         self._episode_count: int = 0
         self._replay_count: int = 0
         self._mutation_count: int = 0
 
         # Build a throwaway env to read spaces, then discard it
-        _, init_config = self.plr.sample()
+        init_config = sampler.sample()
         tmp = _build_ns_env(init_config, self._context_keys, self._context_defaults)
         self.observation_space = tmp.observation_space
         self.action_space = tmp.action_space
         tmp.close()
 
     def reset(self, *, seed=None, options=None):
-        # Score the episode that just ended (skip before first episode).
-        # Prefer mean |advantage| written by the main process after GAE (correct
-        # learning-potential signal).  Fall back to episode return on the first
-        # batch before the score array has been populated (value == 0.0).
-        if self._level_id is not None:
+        # Async feedback may arrive after later episodes have started. Apply it
+        # only to the same level generation, never to a replacement buffer slot.
+        if self._feedback_queue is not None:
+            while True:
+                try:
+                    token, episode, score = self._feedback_queue.get_nowait()
+                except Empty:
+                    break
+                slot = next((i for i, t in self._level_tokens.items() if t == token), None)
+                if slot is None:
+                    self._discarded_scores += 1
+                else:
+                    self.plr.update(slot, score)
+                    self._applied_scores += 1
+        elif self._level_id is not None:
             if self._score_array is not None:
                 td_score = float(self._score_array[self._worker_idx])
                 score = td_score if td_score > 0.0 else self._episode_return
@@ -179,6 +195,9 @@ class PLREnv(gym.Env):
 
         # Sample next config and rebuild env
         self._level_id, config = self.plr.sample()
+        if not self.plr.last_was_replay:
+            self._token_counter += 1
+            self._level_tokens[self._level_id] = self._token_counter
 
         # Track replay/mutation/explore ratios and push stats to main process
         if self.plr.last_was_replay:
@@ -191,6 +210,8 @@ class PLREnv(gym.Env):
             stats["plr/replay_fraction"] = self._replay_count / self._episode_count
             stats["accel/mutation_fraction"] = self._mutation_count / self._episode_count
             stats["plr/episode_return"] = self._episode_return
+            stats["plr/applied_scores"] = self._applied_scores
+            stats["plr/discarded_scores"] = self._discarded_scores
             try:
                 self._stats_queue.put_nowait(stats)
             except Exception:
@@ -202,12 +223,19 @@ class PLREnv(gym.Env):
 
         self._episode_return = 0.0
         obs, info = self._env.reset(seed=seed, options=options)
-        return obs, info
+        return obs, {**info, **self._metadata()}
+
+    def _metadata(self):
+        return {
+            "plr_worker": np.asarray(self._worker_idx, dtype=np.int64),
+            "plr_level": np.asarray(self._level_tokens[self._level_id], dtype=np.int64),
+            "plr_episode": np.asarray(self._episode_count, dtype=np.int64),
+        }
 
     def step(self, action):
         obs, reward, terminated, truncated, info = self._env.step(action)
         self._episode_return += float(reward)
-        return obs, reward, terminated, truncated, info
+        return obs, reward, terminated, truncated, {**info, **self._metadata()}
 
     def close(self):
         if self._env is not None:
@@ -281,11 +309,17 @@ class FixedNSEnv(gym.Env):
         context_defaults: dict | None = None,
     ) -> None:
         super().__init__()
+        self._config = deepcopy(config)
+        self._context_keys = list(context_keys or [])
+        self._context_defaults = dict(context_defaults or {})
         self._env = _build_ns_env(config, context_keys or [], context_defaults or {})
         self.observation_space = self._env.observation_space
         self.action_space = self._env.action_space
 
     def reset(self, *, seed=None, options=None):
+        # Rebuild schedulers/update functions as well as resetting physical values.
+        self._env.close()
+        self._env = _build_ns_env(self._config, self._context_keys, self._context_defaults)
         return self._env.reset(seed=seed, options=options)
 
     def step(self, action):

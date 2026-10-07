@@ -7,6 +7,7 @@ from tqdm import tqdm
 
 from torchrl.envs import ParallelEnv
 from torchrl.envs.utils import ExplorationType, set_exploration_type, step_mdp
+from AAMAS_Comp.evaluation.statistics import trimmed_mean
 
 
 def run_eval_shards(
@@ -80,9 +81,7 @@ def run_eval_shards(
     reward_mean = ep_returns.mean().item()
     steps = ep_lengths.float().mean().item()
 
-    q1, q3 = torch.quantile(ep_returns, torch.tensor([0.25, 0.75], device=device))
-    iqm_mask = (ep_returns >= q1) & (ep_returns <= q3)
-    reward_iqm = ep_returns[iqm_mask].mean().item() if iqm_mask.any() else reward_mean
+    reward_iqm = trimmed_mean(ep_returns.cpu().numpy())
 
     return {
         "eval/reward_mean": reward_mean,

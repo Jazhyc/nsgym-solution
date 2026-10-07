@@ -19,6 +19,8 @@ from __future__ import annotations
 
 import logging
 import os
+import random
+import time
 import warnings
 from pathlib import Path
 
@@ -30,6 +32,7 @@ import multiprocessing as mp
 from functools import partial
 
 import hydra
+import numpy as np
 import torch
 import torch._dynamo
 from omegaconf import DictConfig, OmegaConf
@@ -60,8 +63,10 @@ from AAMAS_Comp.envs.torchrl_factory import (
     make_ns_plr_env,
     make_ns_random_env,
     make_ns_eval_shards,
+    make_static_dr_env,
 )
 from AAMAS_Comp.evaluation.utils import run_eval_shards
+from AAMAS_Comp.curriculum.feedback import EpisodeScores
 
 log = logging.getLogger(__name__)
 
@@ -94,6 +99,8 @@ def train(cfg: DictConfig) -> None:
         torch.set_num_threads(num_threads)
         log.info("torch.set_num_threads(%d)", num_threads)
     torch.manual_seed(cfg.seed)
+    np.random.seed(cfg.seed)
+    random.seed(cfg.seed)
     log.info(f"Device: {device} | Network Device: {network_device} | Seed: {cfg.seed}")
     log.info(f"Config:\n{OmegaConf.to_yaml(cfg)}")
 
@@ -110,6 +117,9 @@ def train(cfg: DictConfig) -> None:
             dir=cfg.wandb.dir,
             reinit=True,
         )
+        wandb.define_metric("train/global_step")
+        for namespace in ("train/*", "eval/*", "test/*", "plr/*", "accel/*"):
+            wandb.define_metric(namespace, step_metric="train/global_step")
     log.info("wandb %s", "enabled" if cfg.wandb.enabled else "disabled")
 
     # ── Environment ────────────────────────────────────────────────────
@@ -146,9 +156,9 @@ def train(cfg: DictConfig) -> None:
     if plr_enabled:
         _plr_mp_manager = mp.Manager()
         plr_stats_queue = _plr_mp_manager.Queue(maxsize=2000)
-        # Shared array written by main process after GAE; each worker reads its own slot.
-        # Size = envs_per_group: groups share slots (same policy, similar scores).
-        plr_score_array = _plr_mp_manager.Array('d', [0.0] * envs_per_group)
+        feedback_queues = [_plr_mp_manager.Queue() for _ in range(num_envs)]
+        episode_scores = EpisodeScores()
+        plr_score_array = None
         collector_factory = None  # replaced by per-worker factory lists below
     elif ns_baseline:
         _plr_mp_manager = None
@@ -161,6 +171,11 @@ def train(cfg: DictConfig) -> None:
         plr_score_array = None
         collector_factory = partial(make_single_env, cfg, device, obs_rms, network_dtype)
 
+    experiment = cfg.get("experiment", {})
+    method = experiment.get("method", None)
+    if method == "standard_dr":
+        collector_factory = partial(make_static_dr_env, cfg, device, obs_rms, network_dtype)
+
     collector_envs = [
         ParallelEnv(
             num_workers=envs_per_group,
@@ -168,11 +183,12 @@ def train(cfg: DictConfig) -> None:
                 [
                     partial(make_ns_plr_env, cfg, device, obs_rms, network_dtype,
                             plr_stats_queue,
-                            worker_idx=w,
-                            score_array=plr_score_array)
+                            worker_idx=g * envs_per_group + w,
+                            feedback_queue=feedback_queues[g * envs_per_group + w])
                     for w in range(envs_per_group)
                 ]
-                if plr_enabled else collector_factory
+                if plr_enabled else [partial(collector_factory,
+                    worker_idx=g * envs_per_group + w) for w in range(envs_per_group)]
             ),
             serial_for_single=True,
         )
@@ -181,7 +197,7 @@ def train(cfg: DictConfig) -> None:
 
     # Use first env only for shape logging
     env = collector_envs[0]
-    train_mode = "PLR" if plr_enabled else ("NS-baseline" if ns_baseline else "stationary")
+    train_mode = method or ("PLR" if plr_enabled else ("NS-baseline" if ns_baseline else "stationary"))
     log.info(
         "Env: %s | mode=%s | num_groups=%d | envs_per_group=%d | total_envs=%d | obs=%s  act=%s",
         cfg.env.id, train_mode, num_groups, envs_per_group, num_groups * envs_per_group,
@@ -190,7 +206,7 @@ def train(cfg: DictConfig) -> None:
     )
 
     num_eval_episodes = cfg.training.get("num_eval_episodes", 5)
-    if plr_enabled or ns_baseline:
+    if plr_enabled or ns_baseline or experiment:
         n_configs = cfg.env.plr.num_eval_configs
         eval_shard_factories = make_ns_eval_shards(cfg, device, obs_rms=obs_rms, dtype=network_dtype)
         log.info(
@@ -211,6 +227,8 @@ def train(cfg: DictConfig) -> None:
     if rpo_alpha > 0:
         log.info("RPO enabled with alpha=%.2f", rpo_alpha)
 
+    # Match initial weights across arms regardless of environment construction.
+    torch.manual_seed(cfg.seed)
     models = make_ppo_models(env, cfg, device=device, network_device=network_device, dtype=network_dtype)
     actor = models["actor"]
     critic = models.get("critic") 
@@ -246,7 +264,10 @@ def train(cfg: DictConfig) -> None:
         frames_per_batch=cfg.collector.frames_per_batch,
         total_frames=cfg.collector.total_frames,
         device=device,
+        num_threads=max(1, int(cfg.get("num_threads", 1))),
+        num_sub_threads=1,
     )
+    collector.set_seed(int(cfg.seed))
 
     # ── Checkpoint directory ───────────────────────────────────────────
     ckpt_dir = Path(cfg.training.checkpoint_dir)
@@ -298,6 +319,7 @@ def train(cfg: DictConfig) -> None:
 
     global_step = 0
     best_eval_iqm = float("-inf")
+    training_started = time.monotonic()
 
     for collect_iter, tensordict_data in enumerate(collector):
         batch_frames = tensordict_data.numel()
@@ -351,15 +373,8 @@ def train(cfg: DictConfig) -> None:
             with torch.no_grad():
                 advantage_module(tensordict_data)
 
-        # Write per-env mean |advantage| to shared array so each PLREnv
-        # subprocess can read its own TD score at the next episode reset.
-        if plr_score_array is not None:
-            # Each batch is one group's data: shape [envs_per_group, T] or flat.
-            # Groups share score slots (same policy → similar scores).
-            td_2d = (tensordict_data.reshape(envs_per_group, -1)
-                     if tensordict_data.ndim == 1 else tensordict_data)
-            for w in range(td_2d.shape[0]):
-                plr_score_array[w] = float(td_2d[w]["advantage"].abs().mean().item())
+        if plr_enabled:
+            episode_scores.update(tensordict_data, feedback_queues)
 
         data_view = tensordict_data.reshape(-1)
         n_sub = cfg.collector.frames_per_batch // cfg.training.sub_batch_size
@@ -429,6 +444,8 @@ def train(cfg: DictConfig) -> None:
             "train/global_step": global_step,
             "train/policy_entropy": policy_entropy,
             "train/epochs_done": epochs_done,
+            "train/wall_seconds": time.monotonic() - training_started,
+            "train/frames_per_second": global_step / (time.monotonic() - training_started),
             **{f"train/{k}": v for k, v in avg_losses.items()},
         }
 
@@ -494,7 +511,6 @@ def train(cfg: DictConfig) -> None:
             pass  # Already closed by collector shutdown
     # ── Final save ─────────────────────────────────────────────────────
     final_path = ckpt_dir / "ppo_final.pt"
-    print(critic)
     PPOAgent(actor=actor, critic=critic, device=device, obs_rms=obs_rms, context_meta=_context_meta).save(str(final_path))
     log.info("Training complete. Final model → %s", final_path)
 
@@ -512,14 +528,41 @@ def train(cfg: DictConfig) -> None:
         )
         log.info("Wrote hparam metric to %s (best eval/reward_iqm=%.4f)", hparam_output_path, best_eval_iqm)
 
-    compute_and_save_fisher(
-        model_path=str(final_path),
-        output_path=str(final_path),
-        actor=actor,
-        tensordict_data=tensordict_data,
-        device=str(device),   # str(device) ..
-        n_samples=cfg.get("fisher_samples", 2000)
-    )
+    if not experiment:
+        compute_and_save_fisher(
+            model_path=str(final_path),
+            output_path=str(final_path),
+            actor=actor,
+            tensordict_data=tensordict_data,
+            device=str(device),
+            n_samples=cfg.get("fisher_samples", 2000),
+        )
+
+    if experiment:
+        import json
+        from importlib.metadata import version
+        metadata = {"method": method, "task": cfg.env.plr.sampler_key,
+                    "seed": int(cfg.seed), "stage": experiment.get("stage", "validation"),
+                    "actual_frames": global_step,
+                    "training_seconds": time.monotonic() - training_started,
+                    "package_versions": {name: version(name) for name in
+                                         ("torch", "torchrl", "tensordict", "gymnasium", "ns-gym", "wandb")},
+                    "config": OmegaConf.to_container(cfg, resolve=True)}
+        (ckpt_dir / "run.json").write_text(json.dumps(metadata, indent=2))
+        if experiment.get("final_evaluation", True):
+            from AAMAS_Comp.evaluation.paper import evaluate_checkpoint
+            metrics = evaluate_checkpoint(str(final_path), experiment.manifest,
+                                          cfg.env.plr.sampler_key, ckpt_dir, metadata)
+            if cfg.wandb.enabled:
+                wandb.log(metrics, step=global_step)
+        if cfg.wandb.enabled:
+            artifact = wandb.Artifact(f"{metadata['stage']}-{cfg.env.plr.sampler_key}-{method}-seed{cfg.seed}",
+                                      type="paper-run", metadata=metadata)
+            for path in ckpt_dir.iterdir():
+                if path.is_file() and (path.suffix in (".json", ".jsonl") or path == final_path):
+                    artifact.add_file(str(path))
+            artifact.add_file(str(experiment.manifest), name="manifest.json")
+            wandb.log_artifact(artifact)
 
     if cfg.wandb.enabled:
         wandb.finish()
