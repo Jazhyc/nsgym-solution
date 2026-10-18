@@ -222,3 +222,6 @@ checkpoints/*/*.pt
 # LaTeX report lives in its own Overleaf-synced git repo
 report/
 *.sbatch
+
+# Local historical diagnostics and superseded experiment records
+/dump/

@@ -1,0 +1,226 @@
+{
+  "commit": "1122b8ab57ce821e2dea712e5e8f1d42866f68a0",
+  "note": "Checked-in configuration, not embedded provenance of historical checkpoints.",
+  "tasks": {
+    "cartpole": {
+      "agent": {
+        "lr": 0.0003,
+        "lr_min": 3e-05,
+        "gamma": 0.99,
+        "eps_clip": 1e-05,
+        "gae_lambda": 0.95,
+        "clip_epsilon": 0.2,
+        "entropy_coeff": 0.0,
+        "critic_coeff": 0.5,
+        "loss_critic_type": "smooth_l1",
+        "optimizer": "adamw",
+        "rpo_alpha": 0,
+        "use_disco": false,
+        "disco_alpha": 2,
+        "disco_beta": 0.6,
+        "use_vtrace": false,
+        "vtrace_rho_thresh": 1.0,
+        "vtrace_c_thresh": 1.0,
+        "hidden_sizes": [
+          64,
+          64
+        ],
+        "activation": "Tanh",
+        "share_trunk": false,
+        "network_device": "cpu",
+        "use_layer_norm": true,
+        "compile": false,
+        "compile_mode": "default",
+        "dtype": "float32"
+      },
+      "env": {
+        "id": "CartPole-v1",
+        "frame_skip": 1,
+        "frame_stack": 1,
+        "normalize_obs": true,
+        "normalize_obs_init_steps": 1000,
+        "normalize_reward": false,
+        "ns_baseline": false,
+        "plr": {
+          "enabled": true,
+          "sampler_key": "cartpole",
+          "capacity": 100,
+          "replay_prob": 0.3,
+          "score_temp": 0.9,
+          "staleness_coef": 0.25,
+          "num_eval_configs": 24,
+          "eval_seed": 42,
+          "mutation_prob": 0.25,
+          "mutation_sigma": 0.2
+        }
+      },
+      "collector": {
+        "num_envs": 24,
+        "num_groups": 2,
+        "total_frames": 10000000,
+        "frames_per_batch": 2560,
+        "max_frames_per_traj": 500
+      },
+      "training": {
+        "num_epochs": 10,
+        "sub_batch_size": 256,
+        "max_grad_norm": 0.2,
+        "target_kl": 0.02,
+        "eval_ratio": 0.2,
+        "eval_rollout_steps": 500,
+        "num_eval_episodes": 12,
+        "save_interval": 10000,
+        "checkpoint_dir": "checkpoints/cartpole"
+      }
+    },
+    "frozenlake": {
+      "agent": {
+        "lr": 0.0005,
+        "lr_min": 1e-05,
+        "gamma": 0.99,
+        "eps_clip": 1e-05,
+        "gae_lambda": 0.95,
+        "clip_epsilon": 0.2,
+        "entropy_coeff": 0.01,
+        "critic_coeff": 0.5,
+        "loss_critic_type": "smooth_l1",
+        "optimizer": "adamw",
+        "rpo_alpha": 0,
+        "use_disco": false,
+        "disco_alpha": 2,
+        "disco_beta": 0.6,
+        "use_vtrace": false,
+        "vtrace_rho_thresh": 1.0,
+        "vtrace_c_thresh": 1.0,
+        "hidden_sizes": [
+          64,
+          64
+        ],
+        "activation": "Tanh",
+        "share_trunk": false,
+        "network_device": "cpu",
+        "use_layer_norm": true,
+        "compile": false,
+        "compile_mode": "default",
+        "dtype": "float32"
+      },
+      "env": {
+        "id": "FrozenLake-v1",
+        "frame_skip": 1,
+        "frame_stack": 1,
+        "normalize_obs": false,
+        "normalize_reward": false,
+        "context_features": [],
+        "context_defaults": {
+          "transition_prob": [
+            0.3333,
+            0.3333,
+            0.3334
+          ]
+        },
+        "ns_baseline": false,
+        "plr": {
+          "enabled": true,
+          "sampler_key": "frozenlake",
+          "capacity": 50,
+          "replay_prob": 0.5,
+          "score_temp": 0.1,
+          "staleness_coef": 0.1,
+          "num_eval_configs": 24,
+          "eval_seed": 42,
+          "mutation_prob": 0.25,
+          "mutation_sigma": 0.2
+        }
+      },
+      "collector": {
+        "num_envs": 24,
+        "num_groups": 2,
+        "total_frames": 4000000,
+        "frames_per_batch": 2560,
+        "max_frames_per_traj": 200
+      },
+      "training": {
+        "num_epochs": 5,
+        "sub_batch_size": 256,
+        "max_grad_norm": 0.5,
+        "target_kl": 0.02,
+        "eval_ratio": 0.25,
+        "eval_rollout_steps": 200,
+        "num_eval_episodes": 12,
+        "save_interval": 10000,
+        "checkpoint_dir": "checkpoints/frozenlake"
+      }
+    },
+    "ant": {
+      "agent": {
+        "lr": 0.0003,
+        "lr_min": 3e-05,
+        "gamma": 0.99,
+        "eps_clip": 1e-05,
+        "gae_lambda": 0.95,
+        "clip_epsilon": 0.2,
+        "entropy_coeff": 0.0,
+        "critic_coeff": 0.5,
+        "loss_critic_type": "smooth_l1",
+        "optimizer": "adamw",
+        "rpo_alpha": 0,
+        "use_disco": false,
+        "disco_alpha": 2,
+        "disco_beta": 0.6,
+        "use_vtrace": false,
+        "vtrace_rho_thresh": 1.0,
+        "vtrace_c_thresh": 1.0,
+        "hidden_sizes": [
+          256,
+          256
+        ],
+        "activation": "Tanh",
+        "share_trunk": false,
+        "network_device": "cpu",
+        "use_layer_norm": true,
+        "compile": false,
+        "compile_mode": "default",
+        "dtype": "float32"
+      },
+      "env": {
+        "id": "Ant-v5",
+        "frame_skip": 5,
+        "frame_stack": 1,
+        "normalize_obs": true,
+        "normalize_obs_init_steps": 1000,
+        "normalize_reward": true,
+        "ns_baseline": false,
+        "plr": {
+          "enabled": true,
+          "sampler_key": "ant",
+          "capacity": 200,
+          "replay_prob": 0.3,
+          "score_temp": 0.9,
+          "staleness_coef": 0.25,
+          "num_eval_configs": 16,
+          "eval_seed": 42,
+          "mutation_prob": 0.25,
+          "mutation_sigma": 0.2
+        }
+      },
+      "collector": {
+        "num_envs": 24,
+        "num_groups": 2,
+        "total_frames": 500000000,
+        "frames_per_batch": 2560,
+        "max_frames_per_traj": 1000
+      },
+      "training": {
+        "num_epochs": 5,
+        "sub_batch_size": 256,
+        "max_grad_norm": 1,
+        "target_kl": 0.02,
+        "eval_ratio": 0.2,
+        "eval_rollout_steps": 1000,
+        "num_eval_episodes": 8,
+        "save_interval": 10000,
+        "checkpoint_dir": "checkpoints/ant"
+      }
+    }
+  }
+}
