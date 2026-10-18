@@ -19,15 +19,20 @@ safely spawn one per subprocess; no score slots are shared between groups.
 from __future__ import annotations
 
 from copy import deepcopy
+from dataclasses import asdict
+import json
+import os
+from pathlib import Path
 from queue import Empty
 from typing import Any
+from uuid import uuid4
 
 import gymnasium as gym
 import numpy as np
 
 from AAMAS_Comp.envs.ns_env_factory import NSEnvConfig, NSEnvFactory
 from AAMAS_Comp.envs.fast_ns_wrapper import FastNSClassicControlWrapper
-from AAMAS_Comp.envs.ns_env_sampler import NS_ENV_SAMPLERS
+from AAMAS_Comp.envs.ns_env_sampler import NS_ENV_SAMPLERS, make_sampler
 from AAMAS_Comp.envs.wrappers import ContextFlatWrapper
 from AAMAS_Comp.curriculum.plr import PLRBuffer
 
@@ -84,6 +89,9 @@ def _build_ns_env(
       the NSWrapper dict obs to a flat float32 array and optionally appends
       context features read from the info dict).
     """
+    from AAMAS_Comp.envs.static_curriculum import StaticDynamicsConfig, build_static_level
+    if isinstance(config, StaticDynamicsConfig):
+        return build_static_level(config)
     if config.env_id in _CLASSIC_CONTROL_IDS:
         base = gym.make(config.env_id, **config.gym_kwargs)
         tunable = {name: pc.build() for name, pc in config.tunable_params.items()}
@@ -133,11 +141,21 @@ class PLREnv(gym.Env):
         feedback_queue=None,
         context_keys: list[str] | None = None,
         context_defaults: dict | None = None,
+        protect_unscored: bool = True,
+        uniform_replay: bool = False,
+        score_ema_alpha: float | None = 1.0,
+        replay_requires_score: bool = True,
+        selection_staleness: bool = True,
+        eviction_strategy: str | None = None,
+        frozenlake_initial_mode: str | None = None,
+        sampler_override=None,
+        audit_dir=None,
     ) -> None:
         super().__init__()
         self._context_keys = list(context_keys or [])
         self._context_defaults = dict(context_defaults or {})
-        sampler = NS_ENV_SAMPLERS[sampler_key](seed=seed)
+        sampler = (sampler_override if sampler_override is not None else
+                   make_sampler(sampler_key, seed, frozenlake_initial_mode))
         self.plr = PLRBuffer(
             sampler,
             capacity=plr_capacity,
@@ -147,6 +165,12 @@ class PLREnv(gym.Env):
             score_temp=score_temp,
             staleness_coef=staleness_coef,
             seed=seed,
+            protect_unscored=protect_unscored,
+            uniform_replay=uniform_replay,
+            score_ema_alpha=score_ema_alpha,
+            replay_requires_score=replay_requires_score,
+            selection_staleness=selection_staleness,
+            eviction_strategy=eviction_strategy,
         )
         self._level_id: int | None = None
         self._episode_return: float = 0.0
@@ -162,6 +186,17 @@ class PLREnv(gym.Env):
         self._episode_count: int = 0
         self._replay_count: int = 0
         self._mutation_count: int = 0
+        self._forced_replay_count: int = 0
+        self._audit_dir = Path(audit_dir) if audit_dir else None
+        self._audit_file = None
+        self._current_selection = None
+        self._episode_steps = 0
+        self._episode_terminated = self._episode_truncated = False
+        self._outcome_recorded = True
+        self._origin_counts = {origin: dict(selection_count=0, replay_count=0,
+                                           completed_count=0, return_sum=0., steps_sum=0,
+                                           partial_count=0)
+                               for origin in ('fresh', 'mutated')}
 
         # Build a throwaway env to read spaces, then discard it
         init_config = sampler.sample()
@@ -171,6 +206,7 @@ class PLREnv(gym.Env):
         tmp.close()
 
     def reset(self, *, seed=None, options=None):
+        self._record_outcome()
         # Async feedback may arrive after later episodes have started. Apply it
         # only to the same level generation, never to a replacement buffer slot.
         if self._feedback_queue is not None:
@@ -182,9 +218,12 @@ class PLREnv(gym.Env):
                 slot = next((i for i, t in self._level_tokens.items() if t == token), None)
                 if slot is None:
                     self._discarded_scores += 1
+                    self._audit('score', token=token, episode=episode, score=score, applied=False)
                 else:
                     self.plr.update(slot, score)
                     self._applied_scores += 1
+                    self._audit('score', token=token, episode=episode, score=score, applied=True,
+                                uid=self.plr._entries[slot].uid)
         elif self._level_id is not None:
             if self._score_array is not None:
                 td_score = float(self._score_array[self._worker_idx])
@@ -198,20 +237,47 @@ class PLREnv(gym.Env):
         if not self.plr.last_was_replay:
             self._token_counter += 1
             self._level_tokens[self._level_id] = self._token_counter
+        entry = self.plr._entries[self._level_id]
+        origin = entry.origin
+        self._origin_counts[origin]['selection_count'] += 1
+        self._origin_counts[origin]['replay_count'] += int(self.plr.last_was_replay)
 
         # Track replay/mutation/explore ratios and push stats to main process
         if self.plr.last_was_replay:
             self._replay_count += 1
         if self.plr.last_was_mutation:
             self._mutation_count += 1
+        if self.plr.last_was_forced_replay:
+            self._forced_replay_count += 1
         self._episode_count += 1
+        self._current_selection = dict(uid=entry.uid, token=self._level_tokens[self._level_id],
+                                       origin=origin, episode=self._episode_count,
+                                       replay=self.plr.last_was_replay,
+                                       mutation_depth=entry.mutation_depth)
+        if not self.plr.last_was_replay:
+            self._audit('level', **self._current_selection, parent_uid=entry.parent_uid,
+                        config=asdict(config))
+        self._audit('selection', **self._current_selection, forced_replay=self.plr.last_was_forced_replay,
+                    conditional_replay_probability=self.plr.last_replay_probability,
+                    conditional_replay_mutated_mass=self.plr.last_replay_mutated_mass,
+                    parent_probability=self.plr.last_parent_probability, score=entry.score,
+                    seed=seed)
         if self._stats_queue is not None:
             stats = self.plr.stats()
+            stats["plr/worker_id"] = self._worker_idx
+            stats["plr/episode_count"] = self._episode_count
+            stats["plr/replay_count"] = self._replay_count
+            stats["accel/mutation_count"] = self._mutation_count
+            stats["plr/forced_replay_count"] = self._forced_replay_count
             stats["plr/replay_fraction"] = self._replay_count / self._episode_count
             stats["accel/mutation_fraction"] = self._mutation_count / self._episode_count
+            stats["plr/forced_replay_fraction"] = self._forced_replay_count / self._episode_count
+            stats["plr/unscored_levels"] = sum(e.n_episodes == 0 for e in self.plr._entries)
             stats["plr/episode_return"] = self._episode_return
             stats["plr/applied_scores"] = self._applied_scores
             stats["plr/discarded_scores"] = self._discarded_scores
+            for label, counts in self._origin_counts.items():
+                stats.update({f'plr/{label}_{key}': value for key, value in counts.items()})
             try:
                 self._stats_queue.put_nowait(stats)
             except Exception:
@@ -222,8 +288,37 @@ class PLREnv(gym.Env):
         self._env = _build_ns_env(config, self._context_keys, self._context_defaults)
 
         self._episode_return = 0.0
+        self._episode_steps = 0
+        self._episode_terminated = self._episode_truncated = False
+        self._outcome_recorded = False
         obs, info = self._env.reset(seed=seed, options=options)
         return obs, {**info, **self._metadata()}
+
+    def _audit(self, event, **data):
+        if self._audit_dir is None:
+            return
+        if self._audit_file is None:
+            self._audit_dir.mkdir(parents=True, exist_ok=True)
+            path = self._audit_dir/f'worker{self._worker_idx}_pid{os.getpid()}_{uuid4().hex[:8]}.jsonl'
+            self._audit_file = path.open('x', buffering=1)
+        self._audit_file.write(json.dumps(dict(schema_version=1, event=event,
+                                               worker=self._worker_idx, **data))+'\n')
+
+    def _record_outcome(self):
+        if self._outcome_recorded or self._current_selection is None:
+            return
+        complete = self._episode_terminated or self._episode_truncated
+        counts = self._origin_counts[self._current_selection['origin']]
+        if complete:
+            counts['completed_count'] += 1
+            counts['return_sum'] += self._episode_return
+            counts['steps_sum'] += self._episode_steps
+        else:
+            counts['partial_count'] += 1
+        self._audit('outcome', **self._current_selection, complete=complete,
+                    episode_return=self._episode_return, steps=self._episode_steps,
+                    terminated=self._episode_terminated, truncated=self._episode_truncated)
+        self._outcome_recorded = True
 
     def _metadata(self):
         return {
@@ -235,11 +330,19 @@ class PLREnv(gym.Env):
     def step(self, action):
         obs, reward, terminated, truncated, info = self._env.step(action)
         self._episode_return += float(reward)
+        self._episode_steps += 1
+        self._episode_terminated, self._episode_truncated = bool(terminated), bool(truncated)
+        if terminated or truncated:
+            self._record_outcome()
         return obs, reward, terminated, truncated, {**info, **self._metadata()}
 
     def close(self):
+        self._record_outcome()
         if self._env is not None:
             self._env.close()
+        if self._audit_file is not None:
+            self._audit_file.close()
+            self._audit_file = None
         super().close()
 
 
@@ -261,11 +364,12 @@ class RandomNSEnv(gym.Env):
         seed: int | None = None,
         context_keys: list[str] | None = None,
         context_defaults: dict | None = None,
+        frozenlake_initial_mode: str | None = None,
     ) -> None:
         super().__init__()
         self._context_keys = list(context_keys or [])
         self._context_defaults = dict(context_defaults or {})
-        self._sampler = NS_ENV_SAMPLERS[sampler_key](seed=seed)
+        self._sampler = make_sampler(sampler_key, seed, frozenlake_initial_mode)
         self._env: gym.Env | None = None
 
         # Build a throwaway env to read spaces, then discard it
@@ -334,6 +438,7 @@ def sample_held_out_configs(
     sampler_key: str,
     n_configs: int,
     seed: int,
+    frozenlake_initial_mode: str | None = None,
 ) -> list[NSEnvConfig]:
     """Sample a fixed set of NS configs for held-out evaluation.
 
@@ -347,5 +452,5 @@ def sample_held_out_configs(
     Returns:
         List of NSEnvConfig objects, fixed for the lifetime of training.
     """
-    sampler = NS_ENV_SAMPLERS[sampler_key](seed=seed)
+    sampler = make_sampler(sampler_key, seed, frozenlake_initial_mode)
     return [sampler.sample() for _ in range(n_configs)]

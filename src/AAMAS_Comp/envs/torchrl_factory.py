@@ -29,12 +29,19 @@ from torchrl.envs.transforms import Transform
 from torchrl.envs.libs.gym import GymWrapper
 
 from AAMAS_Comp.curriculum import PLREnv, FixedNSEnv, RandomNSEnv, sample_held_out_configs
-from AAMAS_Comp.envs.wrappers import NoInfoWrapper, RunningMeanStd, SeededResetWrapper
+from AAMAS_Comp.envs.wrappers import NoInfoWrapper, RunningMeanStd, SeededResetWrapper, WorkerIdentityWrapper
 from AAMAS_Comp.curriculum.feedback import PLR_KEYS
 
 
 def worker_seed(seed, worker_idx=0, stream=0):
     return int(np.random.SeedSequence([int(seed), int(worker_idx), int(stream)]).generate_state(1)[0])
+
+
+def worker_gym_env(env, device, worker_idx):
+    base = GymWrapper(WorkerIdentityWrapper(env, worker_idx), device=device)
+    base.set_info_dict_reader(default_info_dict_reader(
+        keys=["env_worker"], spec={"env_worker": Unbounded(shape=(), dtype=torch.int64)}))
+    return base
 
 log = logging.getLogger(__name__)
 
@@ -134,8 +141,9 @@ def make_single_env(
 ) -> TransformedEnv:
     """Create a single TorchRL TransformedEnv instance."""
     frame_stack = cfg.env.get("frame_stack", 1)
-    base_env = GymWrapper(NoInfoWrapper(SeededResetWrapper(gym.make(cfg.env.id),
-                           worker_seed(cfg.seed, worker_idx, 1))), device=device)
+    base_env = worker_gym_env(NoInfoWrapper(SeededResetWrapper(gym.make(
+                           cfg.env.id, max_episode_steps=cfg.collector.max_frames_per_traj),
+                           worker_seed(cfg.seed, worker_idx, 1))), device, worker_idx)
     return TransformedEnv(base_env, Compose(*_make_env_transforms(
         base_env, obs_rms, frame_stack, cfg.collector.max_frames_per_traj)))
 
@@ -183,12 +191,21 @@ def make_ns_plr_env(
     plr_cfg = cfg.env.plr
     frame_stack = cfg.env.get("frame_stack", 1)
     context_keys, context_defaults = _get_context_cfg(cfg)
+    sampler_override = None
+    if cfg.get('experiment', {}).get('method') in ('static_plr', 'static_plr_mutations'):
+        from AAMAS_Comp.envs.static_curriculum import StaticDynamicsSampler
+        definition = static_training_definition(cfg)
+        sampler_override = StaticDynamicsSampler(plr_cfg.sampler_key, definition['dr_samples'],
+                                                worker_seed(cfg.seed, worker_idx, 2),
+                                                mutation_protocol=plr_cfg.get('static_mutation_protocol',
+                                                    'relative-reflect-symmetric-v2'))
     plr_env = PLREnv(
         sampler_key=plr_cfg.sampler_key,
         plr_capacity=plr_cfg.capacity,
         replay_prob=plr_cfg.replay_prob,
         mutation_prob=plr_cfg.get("mutation_prob", 0.0),
         mutation_sigma=plr_cfg.get("mutation_sigma", 0.2),
+        audit_dir=plr_cfg.get('audit_dir'),
         score_temp=plr_cfg.score_temp,
         staleness_coef=plr_cfg.staleness_coef,
         seed=worker_seed(cfg.seed, worker_idx, 2),
@@ -198,6 +215,14 @@ def make_ns_plr_env(
         feedback_queue=feedback_queue,
         context_keys=context_keys,
         context_defaults=context_defaults,
+        protect_unscored=plr_cfg.get("protect_unscored", True),
+        uniform_replay=plr_cfg.get("uniform_replay", False),
+        score_ema_alpha=plr_cfg.get("score_ema_alpha", 1.0),
+        replay_requires_score=plr_cfg.get("replay_requires_score", True),
+        selection_staleness=plr_cfg.get("selection_staleness", True),
+        eviction_strategy=plr_cfg.get("eviction_strategy", None),
+        frozenlake_initial_mode=cfg.env.get("initial_mode", None),
+        sampler_override=sampler_override,
     )
     base_env = GymWrapper(NoInfoWrapper(SeededResetWrapper(plr_env,
                            worker_seed(cfg.seed, worker_idx, 1)), keep_keys=PLR_KEYS), device=device)
@@ -228,22 +253,33 @@ def make_ns_random_env(
         seed=worker_seed(cfg.seed, worker_idx, 2),
         context_keys=context_keys,
         context_defaults=context_defaults,
+        frozenlake_initial_mode=cfg.env.get("initial_mode", None),
     )
-    base_env = GymWrapper(NoInfoWrapper(SeededResetWrapper(random_env,
-                           worker_seed(cfg.seed, worker_idx, 1))), device=device)
+    base_env = worker_gym_env(NoInfoWrapper(SeededResetWrapper(random_env,
+                           worker_seed(cfg.seed, worker_idx, 1))), device, worker_idx)
     return TransformedEnv(base_env, Compose(*_make_env_transforms(
         base_env, obs_rms, frame_stack, cfg.collector.max_frames_per_traj)))
 
 
-def make_static_dr_env(cfg, device, obs_rms=None, dtype=None, worker_idx=0):
+def static_training_definition(cfg):
     import json
-    from AAMAS_Comp.envs.domain_randomization import DynamicsEnv
     from pathlib import Path
-    definition = json.loads(Path(cfg.experiment.manifest).read_text())["tasks"][cfg.env.plr.sampler_key]
+    manifest = json.loads(Path(cfg.experiment.manifest).read_text())
+    training = manifest.get("training")
+    definition = (training["tasks"] if training else manifest["tasks"])[cfg.env.plr.sampler_key]
+    if training and cfg.env.id == "FrozenLake-v1":
+        if training["frozenlake_initial_mode"] != cfg.env.initial_mode:
+            raise ValueError("FrozenLake DR calibration and training initial mode differ")
+    return definition
+
+
+def make_static_dr_env(cfg, device, obs_rms=None, dtype=None, worker_idx=0):
+    from AAMAS_Comp.envs.domain_randomization import DynamicsEnv
+    definition = static_training_definition(cfg)
     env = DynamicsEnv(cfg.env.plr.sampler_key, definition["dr_ranges"],
                       seed=worker_seed(cfg.seed, worker_idx, 2), samples=definition["dr_samples"])
-    base_env = GymWrapper(NoInfoWrapper(SeededResetWrapper(env,
-                           worker_seed(cfg.seed, worker_idx, 1))), device=device)
+    base_env = worker_gym_env(NoInfoWrapper(SeededResetWrapper(env,
+                           worker_seed(cfg.seed, worker_idx, 1))), device, worker_idx)
     return TransformedEnv(base_env, Compose(*_make_env_transforms(
         base_env, obs_rms, cfg.env.frame_stack, cfg.collector.max_frames_per_traj)))
 
@@ -288,6 +324,7 @@ def make_ns_eval_shards(
         sampler_key=plr_cfg.sampler_key,
         n_configs=plr_cfg.num_eval_configs,
         seed=plr_cfg.eval_seed,
+        frozenlake_initial_mode=cfg.env.get("initial_mode", None),
     )
 
     shards: list[list] = []

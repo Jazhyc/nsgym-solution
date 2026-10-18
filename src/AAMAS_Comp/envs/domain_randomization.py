@@ -6,12 +6,15 @@ import gymnasium as gym
 import numpy as np
 
 from AAMAS_Comp.envs.ns_env_factory import NSEnvConfig, ParamConfig, SchedulerConfig, UpdateFnConfig
+from AAMAS_Comp.envs.constraints import valid_cartpole_parameter
 
 TASK_IDS = {"ant": "Ant-v5", "cartpole": "CartPole-v1", "frozenlake": "FrozenLake-v1"}
 HORIZONS = {"ant": 1000, "cartpole": 500, "frozenlake": 200}
 
 
 def seed_update_functions(env, seed):
+    from ns_gym.schedulers import MemorylessScheduler
+
     rng = np.random.default_rng(seed)
     current = env
     while current is not None:
@@ -22,6 +25,10 @@ def seed_update_functions(env, seed):
             for obj in (fn, fn.scheduler):
                 if hasattr(obj, "rng"):
                     obj.rng = np.random.default_rng(int(rng.integers(0, 2**31)))
+                    # This scheduler draws its first event in __init__. Merely
+                    # replacing its RNG leaves that event seeded from OS entropy.
+                    if isinstance(obj, MemorylessScheduler):
+                        obj.transition_time = obj.rng.geometric(p=obj.p, size=(1,))
         current = current.__dict__.get("env", current.__dict__.get("_env"))
 
 
@@ -60,9 +67,9 @@ def set_parameters(env, task, values):
         mujoco.mj_setState(raw.model, raw.data, state, spec)
         mujoco.mj_forward(raw.model, raw.data)
     elif task == "cartpole":
+        if any(not valid_cartpole_parameter(key, value) for key, value in values.items()):
+            raise ValueError("Invalid CartPole physical parameters")
         for key, value in values.items():
-            if key in ("masspole", "masscart", "length") and value <= 1e-6:
-                raise ValueError(f"{key} must be positive")
             setattr(raw, key, float(value))
         raw.total_mass = raw.masspole + raw.masscart
         raw.polemass_length = raw.length * raw.masspole

@@ -497,7 +497,7 @@ FROZENLAKE_PARAM_SPECS: list[ParamSpec] = [
 # Named sampler catalogue
 # ---------------------------------------------------------------------------
 
-def _sample_frozenlake_wrapper_kwargs(rng: np.random.Generator) -> dict:
+def _sample_frozenlake_wrapper_kwargs(rng: np.random.Generator, initial_mode="random") -> dict:
     """Sample a starting distribution with uniform p_straight coverage.
 
     Samples p_straight ~ Uniform[0,1] directly, then distributes the remainder
@@ -510,6 +510,12 @@ def _sample_frozenlake_wrapper_kwargs(rng: np.random.Generator) -> dict:
     p_straight = rng.uniform(0.0, 1.0)
     p_left = rng.uniform(0.0, 1.0 - p_straight)
     p_right = 1.0 - p_straight - p_left
+    if initial_mode == "uniform":
+        # Consume the same draws so changing the initial-condition factor
+        # does not also change subsequent sampled schedules/mutation noise.
+        return {"initial_prob_dist": [1 / 3] * 3}
+    if initial_mode != "random":
+        raise ValueError(f"Unknown FrozenLake initial mode: {initial_mode}")
     return {"initial_prob_dist": [float(p_straight), float(p_left), float(p_right)]}
 
 
@@ -524,10 +530,8 @@ NS_ENV_SAMPLERS: dict[str, callable] = {
         param_specs=CARTPOLE_PARAM_SPECS,
         seed=seed,
     ),
-    # FrozenLake-v1 default is is_slippery=True → transition dist [1/3, 1/3, 1/3].
-    # The competition starts from this default, so we match it here.
-    # The original code used [1,0,0] (deterministic), which was wrong and caused
-    # PLR to train exclusively on near-deterministic dynamics.
+    # Keep the catalog's legacy random-start distribution for frozen broad
+    # evaluation definitions. Training selects its initial mode explicitly.
     "frozenlake": lambda seed=None: NSEnvSampler(
         env_id="FrozenLake-v1",
         param_specs=FROZENLAKE_PARAM_SPECS,
@@ -536,3 +540,20 @@ NS_ENV_SAMPLERS: dict[str, callable] = {
         seed=seed,
     ),
 }
+
+
+def make_sampler(sampler_key, seed=None, frozenlake_initial_mode=None):
+    """Construct a worker-local sampler without changing the global catalog.
+
+    The mode applies to both fresh FrozenLake levels and mutation offspring.
+    None preserves the catalog's legacy random starts; test definitions are
+    consequently independent of the selected training condition.
+    """
+    from functools import partial
+    sampler = NS_ENV_SAMPLERS[sampler_key](seed=seed)
+    if sampler_key == "frozenlake":
+        mode = frozenlake_initial_mode or "random"
+        if mode not in ("random", "uniform"):
+            raise ValueError(f"Unknown FrozenLake initial mode: {mode}")
+        sampler.wrapper_kwargs_sampler = partial(_sample_frozenlake_wrapper_kwargs, initial_mode=mode)
+    return sampler

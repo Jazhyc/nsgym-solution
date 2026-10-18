@@ -52,7 +52,7 @@ import wandb
 
 from AAMAS_Comp.optimizers.cbp import ContinualBackpropagation
 
-from torchrl.collectors import MultiAsyncCollector
+from torchrl.collectors import MultiAsyncCollector, MultiSyncCollector
 from torchrl.envs import ParallelEnv
 
 from AAMAS_Comp.agents.ppo import PPOAgent, make_ppo_models, RPOTanhNormal
@@ -67,6 +67,8 @@ from AAMAS_Comp.envs.torchrl_factory import (
 )
 from AAMAS_Comp.evaluation.utils import run_eval_shards
 from AAMAS_Comp.curriculum.feedback import EpisodeScores
+from AAMAS_Comp.agents.episode_batches import CompleteEpisodes, estimate_advantages
+from AAMAS_Comp.evaluation.training_metrics import TrainingEpisodes, WorkerCurriculumMetrics
 
 log = logging.getLogger(__name__)
 
@@ -157,7 +159,7 @@ def train(cfg: DictConfig) -> None:
         _plr_mp_manager = mp.Manager()
         plr_stats_queue = _plr_mp_manager.Queue(maxsize=2000)
         feedback_queues = [_plr_mp_manager.Queue() for _ in range(num_envs)]
-        episode_scores = EpisodeScores()
+        episode_scores = EpisodeScores(require_complete=True)
         plr_score_array = None
         collector_factory = None  # replaced by per-worker factory lists below
     elif ns_baseline:
@@ -258,7 +260,9 @@ def train(cfg: DictConfig) -> None:
     # ── Data collector ─────────────────────────────────────────────────
     # ObservationNorm is in the env transforms → observations in tensordict
     # are already normalized. Use plain actor for collection.
-    collector = MultiAsyncCollector(
+    collector_class = (MultiSyncCollector if cfg.collector.get("synchronous", False)
+                       else MultiAsyncCollector)
+    collector = collector_class(
         collector_envs,
         actor,
         frames_per_batch=cfg.collector.frames_per_batch,
@@ -320,6 +324,17 @@ def train(cfg: DictConfig) -> None:
     global_step = 0
     best_eval_iqm = float("-inf")
     training_started = time.monotonic()
+    completed_episodes = TrainingEpisodes(frozenlake=cfg.env.plr.sampler_key == "frozenlake")
+    curriculum_metrics = WorkerCurriculumMetrics(num_envs)
+    feedback_sent = 0
+    last_metric_values = {}
+    complete_batches = CompleteEpisodes() if cfg.training.get("complete_episodes", False) else None
+    bootstrap_timeouts = cfg.agent.get("bootstrap_timeouts", True)
+    if complete_batches is not None:
+        if not cfg.collector.get("synchronous", False) or ret_normalizer is not None:
+            raise ValueError("Complete episodes require synchronous collection and raw rewards")
+        if use_vtrace:
+            raise ValueError("Complete-episode diagnostics use GAE, not V-trace")
 
     for collect_iter, tensordict_data in enumerate(collector):
         batch_frames = tensordict_data.numel()
@@ -335,10 +350,17 @@ def train(cfg: DictConfig) -> None:
 
         # ── Save raw reward for logging (before normalization) ─────────
         raw_mean_reward = tensordict_data["next", "reward"].mean().item()
+        episode_metrics = completed_episodes.update(tensordict_data)
 
         # ── Normalize rewards (VecNormalize-style) ─────────────────────
         if ret_normalizer is not None:
             ret_normalizer.normalize_batch(tensordict_data)
+
+        if complete_batches is not None:
+            tensordict_data = complete_batches.update(tensordict_data)
+            if tensordict_data is None:
+                pbar.update(batch_frames)
+                continue
 
         # ── PPO inner optimisation ─────────────────────────────────────
         epoch_losses: dict[str, list[float]] = {
@@ -362,7 +384,7 @@ def train(cfg: DictConfig) -> None:
                     td_seq = tensordict_data.reshape(num_envs, time_steps)
                 else:
                     td_seq = tensordict_data
-                advantage_module(td_seq)
+                estimate_advantages(advantage_module, td_seq, bootstrap_timeouts=bootstrap_timeouts)
                 if tensordict_data.ndim == 1:
                     tensordict_data = td_seq.reshape(-1)
 
@@ -371,13 +393,19 @@ def train(cfg: DictConfig) -> None:
         # so recomputing GAE every epoch is not worth the extra critic forward pass.
         if not use_vtrace:
             with torch.no_grad():
-                advantage_module(tensordict_data)
+                estimate_advantages(advantage_module, tensordict_data, bootstrap_timeouts=bootstrap_timeouts)
 
         if plr_enabled:
-            episode_scores.update(tensordict_data, feedback_queues)
+            feedback_sent += episode_scores.update(tensordict_data, feedback_queues)
+            episode_metrics.update({
+                "plr/incomplete_episode_scores_total": episode_scores.incomplete_episodes,
+                "plr/abandoned_episode_scores_total": episode_scores.abandoned_episodes,
+            })
 
         data_view = tensordict_data.reshape(-1)
         n_sub = cfg.collector.frames_per_batch // cfg.training.sub_batch_size
+        if complete_batches is not None:
+            n_sub = (data_view.numel() + cfg.training.sub_batch_size - 1) // cfg.training.sub_batch_size
 
         for _epoch in range(cfg.training.num_epochs):
             perm = torch.randperm(data_view.batch_size[0], device=device)
@@ -439,6 +467,7 @@ def train(cfg: DictConfig) -> None:
 
         metrics = {
             "train/reward_mean": mean_reward,
+            "train/reward_per_step_mean": mean_reward,
             "train/step_count_max": max_step_count,
             "train/lr": lr_now,
             "train/global_step": global_step,
@@ -447,7 +476,13 @@ def train(cfg: DictConfig) -> None:
             "train/wall_seconds": time.monotonic() - training_started,
             "train/frames_per_second": global_step / (time.monotonic() - training_started),
             **{f"train/{k}": v for k, v in avg_losses.items()},
+            **episode_metrics,
         }
+        if plr_enabled:
+            metrics["plr/feedback_sent_total"] = feedback_sent
+        if complete_batches is not None:
+            metrics["train/complete_episode_frames_total"] = complete_batches.frames_emitted
+            metrics["train/pending_episode_frames"] = complete_batches.pending_frames
 
         # ── Evaluation ────────────────────────────────────────────────
         if global_step >= next_eval_frame:
@@ -479,12 +514,9 @@ def train(cfg: DictConfig) -> None:
                 except Exception:
                     break
             if plr_samples:
-                plr_keys = plr_samples[0].keys()
-                metrics.update({
-                    k: sum(s[k] for s in plr_samples) / len(plr_samples)
-                    for k in plr_keys
-                })
+                metrics.update(curriculum_metrics.update(plr_samples))
 
+        last_metric_values.update(metrics)
         if cfg.wandb.enabled:
             wandb.log(metrics, step=global_step)
 
@@ -548,20 +580,33 @@ def train(cfg: DictConfig) -> None:
                     "package_versions": {name: version(name) for name in
                                          ("torch", "torchrl", "tensordict", "gymnasium", "ns-gym", "wandb")},
                     "config": OmegaConf.to_container(cfg, resolve=True)}
+        if cfg.wandb.enabled:
+            metadata["wandb_run"] = {"entity": wandb.run.entity, "project": wandb.run.project,
+                                     "id": wandb.run.id, "url": wandb.run.url}
         (ckpt_dir / "run.json").write_text(json.dumps(metadata, indent=2))
+        (ckpt_dir / "training_metrics_summary.json").write_text(json.dumps({
+            "semantics": "Last logged value of each training/validation metric, matching W&B summaries",
+            "metrics": last_metric_values}, indent=2))
         if experiment.get("final_evaluation", True):
             from AAMAS_Comp.evaluation.paper import evaluate_checkpoint
             metrics = evaluate_checkpoint(str(final_path), experiment.manifest,
                                           cfg.env.plr.sampler_key, ckpt_dir, metadata)
+            if experiment.get("public_evaluation", False):
+                from AAMAS_Comp.evaluation.public import evaluate_public_checkpoint
+                metrics.update(evaluate_public_checkpoint(
+                    str(final_path), cfg.env.plr.sampler_key, ckpt_dir, metadata,
+                    episodes_per_level=int(experiment.get("public_episodes", 100))))
             if cfg.wandb.enabled:
                 wandb.log(metrics, step=global_step)
         if cfg.wandb.enabled:
             artifact = wandb.Artifact(f"{metadata['stage']}-{cfg.env.plr.sampler_key}-{method}-seed{cfg.seed}",
                                       type="paper-run", metadata=metadata)
             for path in ckpt_dir.iterdir():
-                if path.is_file() and (path.suffix in (".json", ".jsonl") or path == final_path):
+                if path.is_file() and (path.suffix in (".json", ".jsonl", ".npz") or path == final_path):
                     artifact.add_file(str(path))
             artifact.add_file(str(experiment.manifest), name="manifest.json")
+            if (ckpt_dir/'curriculum').is_dir():
+                artifact.add_dir(str(ckpt_dir/'curriculum'), name='curriculum')
             wandb.log_artifact(artifact)
 
     if cfg.wandb.enabled:

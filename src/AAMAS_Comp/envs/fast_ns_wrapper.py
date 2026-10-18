@@ -5,7 +5,7 @@ Drops the per-step costs that the stock NSClassicControlWrapper pays regardless
 of configuration:
 
   1. _constraint_checker: string class-name dispatch + warning infrastructure.
-     Our sampler already keeps params in safe ranges; we skip this.
+     CartPole retains the native physical constraints using direct numeric checks.
   2. NSWrapper.step(): builds 4 dicts + nested obs dict on every step even when
      change_notification=False. We bypass it and call gym.Wrapper.step directly.
   3. _dependency_resolver: class-name dispatch + equality checks before setattr.
@@ -29,6 +29,7 @@ import gymnasium as gym
 import numpy as np
 
 import ns_gym.base as base
+from AAMAS_Comp.envs.constraints import valid_cartpole_parameter
 
 
 class FastNSClassicControlWrapper(gym.Wrapper):
@@ -52,6 +53,8 @@ class FastNSClassicControlWrapper(gym.Wrapper):
         self.tunable_params = tunable_params
         self._has_cartpole_deps = has_cartpole_deps
         self.t = 0
+        self._is_cartpole = env.unwrapped.__class__.__name__ == 'CartPoleEnv'
+        self.rejected_updates = 0
 
         # Store initial param values for reset
         self._initial_params = {
@@ -68,6 +71,9 @@ class FastNSClassicControlWrapper(gym.Wrapper):
         unwrapped = self.env.unwrapped
         for p, fn in self.tunable_params.items():
             new_val, _, _ = fn(getattr(unwrapped, p), self.t)
+            if self._is_cartpole and not valid_cartpole_parameter(p, new_val):
+                self.rejected_updates += 1
+                continue
             setattr(unwrapped, p, new_val)
 
         # 2. Inline CartPole dependency resolution (no class-name dispatch)
@@ -83,6 +89,7 @@ class FastNSClassicControlWrapper(gym.Wrapper):
     def reset(self, *, seed=None, options=None):
         obs, info = self.env.reset(seed=seed, options=options)
         self.t = 0
+        self.rejected_updates = 0
         # Restore initial parameter values (matches NSClassicControlWrapper behaviour)
         unwrapped = self.env.unwrapped
         for k, v in self._initial_params.items():

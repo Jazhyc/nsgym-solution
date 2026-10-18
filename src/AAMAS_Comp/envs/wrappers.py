@@ -11,6 +11,22 @@ import gymnasium as gym
 from gymnasium import Wrapper as GymnasiumWrapper
 
 
+class WorkerIdentityWrapper(GymnasiumWrapper):
+    """Keep episode-metric namespaces distinct across asynchronous groups."""
+
+    def __init__(self, env, worker_idx):
+        super().__init__(env)
+        self.worker_idx = int(worker_idx)
+
+    def reset(self, **kwargs):
+        obs, info = self.env.reset(**kwargs)
+        return obs, {**info, "env_worker": np.asarray(self.worker_idx, dtype=np.int64)}
+
+    def step(self, action):
+        obs, reward, terminal, truncated, info = self.env.step(action)
+        return obs, reward, terminal, truncated, {**info, "env_worker": np.asarray(self.worker_idx, dtype=np.int64)}
+
+
 class ContextFlatWrapper(GymnasiumWrapper):
     """Converts NSWrapper dict obs ``{"state": int, ...}`` to a flat float32 array.
 
@@ -135,16 +151,30 @@ class FastNSFrozenLakeWrapper(gym.Wrapper):
         self.t = 0
         self._s = 0
 
-        # Pre-extract fixed neighbor structure from gym's P dict.
-        # neighbors shape: (n_states, n_actions, 3) — axis-2 = [straight, left, right]
+        # NS-Gym orders outcomes as [action, action+1, action-1]. Gym's
+        # slippery P table uses [action-1, action, action+1], so copying that
+        # table directly assigns asymmetric probabilities to the wrong moves.
+        # Build the neighbors explicitly, also supporting non-slippery bases.
         n_s = env.observation_space.n
         n_a = env.action_space.n
         self._next_states = np.zeros((n_s, n_a, 3), dtype=np.int32)
         self._rewards     = np.zeros((n_s, n_a, 3), dtype=np.float32)
         self._dones       = np.zeros((n_s, n_a, 3), dtype=bool)
+        raw = env.unwrapped
+        moves = ((0, -1), (1, 0), (0, 1), (-1, 0))
         for s in range(n_s):
+            row, col = divmod(s, raw.ncol)
             for a in range(n_a):
-                for i, (_, ns, r, d) in enumerate(env.unwrapped.P[s][a]):
+                for i, direction in enumerate((a, (a + 1) % 4, (a - 1) % 4)):
+                    if raw.desc[row, col] in (b"G", b"H"):
+                        ns, r, d = s, 0.0, True
+                    else:
+                        dr, dc = moves[direction]
+                        nr = int(np.clip(row + dr, 0, raw.nrow - 1))
+                        nc = int(np.clip(col + dc, 0, raw.ncol - 1))
+                        ns = nr * raw.ncol + nc
+                        tile = raw.desc[nr, nc]
+                        r, d = float(tile == b"G"), tile in (b"G", b"H")
                     self._next_states[s, a, i] = ns
                     self._rewards[s, a, i]     = r
                     self._dones[s, a, i]       = d
@@ -160,6 +190,9 @@ class FastNSFrozenLakeWrapper(gym.Wrapper):
 
     def reset(self, *, seed=None, options=None):
         obs, info = self.env.reset(seed=seed, options=options)
+        # Gym seeds this generator and consumes the initial-state draw on
+        # reset. Sharing it reproduces the stock simulator's seeded sampling.
+        self._rng = self.env.unwrapped.np_random
         self._prob = self._initial_prob.copy()
         self._s = int(obs)
         self.t = 0

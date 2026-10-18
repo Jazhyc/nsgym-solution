@@ -1,5 +1,6 @@
 # ── FrozenLake environment ───────────────────────────────────────────────────
 id: FrozenLake-v1
+initial_mode: uniform  # applies to fresh levels, mutations and validation; broad tests stay frozen
 frame_skip: 1
 
 # FrozenLake has a discrete integer observation (0–15 for the 4×4 grid).
@@ -31,6 +32,11 @@ ns_baseline: false
 # Set enabled: true to rotate NS configs during training via PLR.
 # Eval always uses a fixed held-out set (eval_seed) regardless of this flag.
 plr:
+  # Corrected PLR semantics; recorded in every resolved run configuration.
+  score_ema_alpha: 1.0        # latest completed-episode score
+  replay_requires_score: true
+  selection_staleness: true
+  eviction_strategy: null     # score for PLR; random for uniform controls
   enabled: true
   sampler_key: frozenlake    # key into NS_ENV_SAMPLERS
   capacity: 50                # smaller buffer — FrozenLake param space is narrower
