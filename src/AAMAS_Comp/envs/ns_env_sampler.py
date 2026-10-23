@@ -519,7 +519,13 @@ def _sample_frozenlake_wrapper_kwargs(rng: np.random.Generator, initial_mode="ra
     return {"initial_prob_dist": [float(p_straight), float(p_left), float(p_right)]}
 
 
+def _ant_v2_sampler(seed=None):
+    from .ant_curriculum import make_ant_v2_sampler
+    return make_ant_v2_sampler(seed)
+
+
 NS_ENV_SAMPLERS: dict[str, callable] = {
+    "ant_v2": _ant_v2_sampler,
     "ant": lambda seed=None: NSEnvSampler(
         env_id="Ant-v5",
         param_specs=ANT_PARAM_SPECS,

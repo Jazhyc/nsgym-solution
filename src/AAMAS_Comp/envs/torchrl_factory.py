@@ -195,7 +195,7 @@ def make_ns_plr_env(
     if cfg.get('experiment', {}).get('method') in ('static_plr', 'static_plr_mutations'):
         from AAMAS_Comp.envs.static_curriculum import StaticDynamicsSampler
         definition = static_training_definition(cfg)
-        sampler_override = StaticDynamicsSampler(plr_cfg.sampler_key, definition['dr_samples'],
+        sampler_override = StaticDynamicsSampler(task_key(cfg), definition['dr_samples'],
                                                 worker_seed(cfg.seed, worker_idx, 2),
                                                 mutation_protocol=plr_cfg.get('static_mutation_protocol',
                                                     'relative-reflect-symmetric-v2'))
@@ -261,12 +261,20 @@ def make_ns_random_env(
         base_env, obs_rms, frame_stack, cfg.collector.max_frames_per_traj)))
 
 
+def task_key(cfg):
+    """The task identity is independent of the versioned training sampler."""
+    return 'ant' if cfg.env.plr.sampler_key == 'ant_v2' else cfg.env.plr.sampler_key
+
+
 def static_training_definition(cfg):
     import json
     from pathlib import Path
     manifest = json.loads(Path(cfg.experiment.manifest).read_text())
     training = manifest.get("training")
-    definition = (training["tasks"] if training else manifest["tasks"])[cfg.env.plr.sampler_key]
+    definition = (training["tasks"] if training else manifest["tasks"])[task_key(cfg)]
+    if cfg.env.plr.sampler_key == 'ant_v2':
+        from .ant_curriculum import validate_ant_samples
+        validate_ant_samples(definition['dr_samples'])
     if training and cfg.env.id == "FrozenLake-v1":
         if training["frozenlake_initial_mode"] != cfg.env.initial_mode:
             raise ValueError("FrozenLake DR calibration and training initial mode differ")
@@ -276,7 +284,7 @@ def static_training_definition(cfg):
 def make_static_dr_env(cfg, device, obs_rms=None, dtype=None, worker_idx=0):
     from AAMAS_Comp.envs.domain_randomization import DynamicsEnv
     definition = static_training_definition(cfg)
-    env = DynamicsEnv(cfg.env.plr.sampler_key, definition["dr_ranges"],
+    env = DynamicsEnv(task_key(cfg), definition["dr_ranges"],
                       seed=worker_seed(cfg.seed, worker_idx, 2), samples=definition["dr_samples"])
     base_env = worker_gym_env(NoInfoWrapper(SeededResetWrapper(env,
                            worker_seed(cfg.seed, worker_idx, 1))), device, worker_idx)

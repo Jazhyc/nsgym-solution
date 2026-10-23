@@ -263,7 +263,8 @@ def evaluate_checkpoint(checkpoint_path, manifest_path, task, output_dir, metada
                 if suite == "iid":
                     env = _build_ns_env(decode_config(config["config"]))
                 else:
-                    env = DynamicsEnv(task, definition["dr_ranges"], intervention=config["intervention"])
+                    env = DynamicsEnv(task, definition["dr_ranges"], intervention=config["intervention"],
+                                      native_ant_reward=manifest.get('native_ant_reward', False))
                 try:
                     for seed in config["seeds"]:
                         # Rebuild iid update functions for every rollout seed.

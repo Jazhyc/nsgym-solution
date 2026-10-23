@@ -113,6 +113,12 @@ class NSEnvFactory:
         )
 
         if family == "mujoco":
+            protocol = common.pop("ant_physics_protocol", None)
+            if protocol is not None:
+                if config.env_id != "Ant-v5" or protocol != "bounded-v2":
+                    raise ValueError(f"Unsupported Ant physics protocol: {protocol}")
+                from .ant_curriculum import BoundedAntWrapper
+                return BoundedAntWrapper(base_env, tunable, **common)
             return MujocoWrapper(base_env, tunable, **common)
         if family == "classic":
             return NSClassicControlWrapper(base_env, tunable, **common)

@@ -56,6 +56,8 @@ from torchrl.collectors import MultiAsyncCollector, MultiSyncCollector
 from torchrl.envs import ParallelEnv
 
 from AAMAS_Comp.agents.ppo import PPOAgent, make_ppo_models, RPOTanhNormal
+from AAMAS_Comp.agents.recovery import check_finite, learner_state, restore_learner, validate_models
+from AAMAS_Comp.agents.policy_checks import nonnegative_sample_kl
 from AAMAS_Comp.envs.wrappers import RunningMeanStd, RewardNormalizer
 from AAMAS_Comp.envs.torchrl_factory import (
     initialize_obs_norm,
@@ -64,6 +66,7 @@ from AAMAS_Comp.envs.torchrl_factory import (
     make_ns_random_env,
     make_ns_eval_shards,
     make_static_dr_env,
+    task_key,
 )
 from AAMAS_Comp.evaluation.utils import run_eval_shards
 from AAMAS_Comp.curriculum.feedback import EpisodeScores
@@ -103,6 +106,17 @@ def train(cfg: DictConfig) -> None:
     torch.manual_seed(cfg.seed)
     np.random.seed(cfg.seed)
     random.seed(cfg.seed)
+    resume_path = cfg.training.get("resume_checkpoint")
+    resume = torch.load(resume_path, map_location=device, weights_only=False) if resume_path else None
+    resume_frames = int(cfg.training.get("resume_global_step", 0))
+    resume_iteration = int(cfg.training.get("resume_collect_iter", -1))
+    if resume is not None:
+        validate_models(resume)
+        if resume.get("training_state") is not None:
+            resume_frames = int(resume["training_state"]["global_step"])
+            resume_iteration = int(resume["training_state"]["collect_iter"])
+        if not 0 < resume_frames < cfg.collector.total_frames or resume_iteration < 0:
+            raise ValueError("Recovery requires a valid checkpoint frame/iteration offset")
     log.info(f"Device: {device} | Network Device: {network_device} | Seed: {cfg.seed}")
     log.info(f"Config:\n{OmegaConf.to_yaml(cfg)}")
 
@@ -140,11 +154,20 @@ def train(cfg: DictConfig) -> None:
     
     # ── Observation normalization ────────────────────────────────────
     obs_rms = initialize_obs_norm(cfg, device, dtype=network_dtype)
+    if resume is not None and obs_rms is not None:
+        full_obs = resume.get("training_state", {}).get("obs_rms")
+        if full_obs is not None:
+            obs_rms.load_state_dict(full_obs)
+        elif resume.get("obs_rms") is not None:
+            obs_rms.mean = resume["obs_rms"]["mean"].to(device).double()
+            obs_rms.var = resume["obs_rms"]["std"].to(device).double().square()
 
     # ── Reward normalization (VecNormalize-style) ──────────────────────
     ret_normalizer = None
     if cfg.env.get("normalize_reward", False):
         ret_normalizer = RewardNormalizer(device=device)
+        if resume is not None and resume.get("training_state", {}).get("reward_rms") is not None:
+            ret_normalizer.reward_rms.load_state_dict(resume["training_state"]["reward_rms"])
         log.info("Reward normalization enabled")
 
     num_groups = cfg.collector.get("num_groups", 1)
@@ -239,6 +262,8 @@ def train(cfg: DictConfig) -> None:
     optimizer = models["optimizer"]
     scheduler = models["scheduler"]
     optim_params = models["optim_params"]
+    if resume is not None:
+        restore_learner(resume, actor, critic, optimizer, scheduler, resume_iteration + 1)
 
     # ── Continual Backpropagation (optional) ──────────────────────────
     cbp = None
@@ -266,7 +291,8 @@ def train(cfg: DictConfig) -> None:
         collector_envs,
         actor,
         frames_per_batch=cfg.collector.frames_per_batch,
-        total_frames=cfg.collector.total_frames,
+        total_frames=min(cfg.collector.total_frames - resume_frames,
+                         int(cfg.training.get("max_additional_frames", cfg.collector.total_frames))),
         device=device,
         num_threads=max(1, int(cfg.get("num_threads", 1))),
         num_sub_threads=1,
@@ -276,6 +302,16 @@ def train(cfg: DictConfig) -> None:
     # ── Checkpoint directory ───────────────────────────────────────────
     ckpt_dir = Path(cfg.training.checkpoint_dir)
     ckpt_dir.mkdir(parents=True, exist_ok=True)
+    if resume is not None:
+        import json
+        (ckpt_dir / "recovery_provenance.json").write_text(json.dumps({
+            "checkpoint": str(resume_path), "restored_frames": resume_frames,
+            "restored_collect_iter": resume_iteration, "exact_resume": False,
+            "optimizer_restored": "training_state" in resume,
+            "reward_normalizer_restored": bool(resume.get("training_state", {}).get("reward_rms")),
+            "worker_buffers_rng_and_simulator_state_restored": False,
+            "minibatch_kl_guard": bool(cfg.training.get("minibatch_kl_guard", False)),
+        }, indent=2))
 
     # ── Context metadata (for inference-time obs reconstruction) ──────
     from omegaconf import OmegaConf as _OC
@@ -313,15 +349,15 @@ def train(cfg: DictConfig) -> None:
 
     # ── Training loop ──────────────────────────────────────────────────
     total_frames = cfg.collector.total_frames
-    pbar = tqdm(total=total_frames, desc="Training")
+    pbar = tqdm(total=total_frames, initial=resume_frames, desc="Training")
 
     # Eval scheduling: trigger eval at evenly-spaced frame thresholds.
     # eval_ratio=0.1 → eval at 0%, 10%, 20%, …, 100% of total_frames.
     eval_ratio = cfg.training.get("eval_ratio", 0.1)
     eval_every_frames = max(1, int(total_frames * eval_ratio))
-    next_eval_frame = 0  # eval on first iteration
+    next_eval_frame = ((resume_frames // eval_every_frames) + 1) * eval_every_frames if resume else 0
 
-    global_step = 0
+    global_step = resume_frames
     best_eval_iqm = float("-inf")
     training_started = time.monotonic()
     completed_episodes = TrainingEpisodes(frozenlake=cfg.env.plr.sampler_key == "frozenlake")
@@ -336,9 +372,12 @@ def train(cfg: DictConfig) -> None:
         if use_vtrace:
             raise ValueError("Complete-episode diagnostics use GAE, not V-trace")
 
-    for collect_iter, tensordict_data in enumerate(collector):
+    kl_guard_stops = 0
+    for collect_iter, tensordict_data in enumerate(collector, start=resume_iteration + 1):
         batch_frames = tensordict_data.numel()
         global_step += batch_frames
+        check_finite({str(k): v for k, v in tensordict_data.items(True, True)},
+                     stage="collected batch", frames=global_step, directory=ckpt_dir, batch=tensordict_data)
         did_eval_this_iter = False
 
         # Drop actor intermediate outputs — ClipPPOLoss recomputes them from
@@ -396,6 +435,9 @@ def train(cfg: DictConfig) -> None:
                 estimate_advantages(advantage_module, tensordict_data, bootstrap_timeouts=bootstrap_timeouts)
 
         if plr_enabled:
+            check_finite({"advantage": tensordict_data["advantage"],
+                          "value_target": tensordict_data["value_target"]},
+                         stage="GAE", frames=global_step, directory=ckpt_dir, batch=tensordict_data)
             feedback_sent += episode_scores.update(tensordict_data, feedback_queues)
             episode_metrics.update({
                 "plr/incomplete_episode_scores_total": episode_scores.incomplete_episodes,
@@ -403,10 +445,12 @@ def train(cfg: DictConfig) -> None:
             })
 
         data_view = tensordict_data.reshape(-1)
-        n_sub = cfg.collector.frames_per_batch // cfg.training.sub_batch_size
-        if complete_batches is not None:
-            n_sub = (data_view.numel() + cfg.training.sub_batch_size - 1) // cfg.training.sub_batch_size
+        # Collectors round batches to whole environment steps. Include the
+        # remainder instead of silently discarding transitions every epoch.
+        n_sub = (data_view.numel() + cfg.training.sub_batch_size - 1) // cfg.training.sub_batch_size
 
+        stop_for_kl = False
+        guard_kls = []
         for _epoch in range(cfg.training.num_epochs):
             perm = torch.randperm(data_view.batch_size[0], device=device)
             epoch_kl = 0.0
@@ -414,6 +458,26 @@ def train(cfg: DictConfig) -> None:
             for i in range(n_sub):
                 idx = perm[i * cfg.training.sub_batch_size : (i + 1) * cfg.training.sub_batch_size]
                 subdata = data_view[idx]
+
+                # Reject excessive policy changes before PPO exponentiates the
+                # importance ratio. Computing the loss first can overflow even
+                # when the collected observations and advantages are finite.
+                if (cfg.training.get("minibatch_kl_guard", False)
+                        and cfg.training.get("nonnegative_kl_guard", False)
+                        and target_kl is not None):
+                    with torch.no_grad():
+                        current_log_prob = actor.get_dist(subdata).log_prob(subdata["action"])
+                        behavior_log_prob = subdata[loss_module.tensor_keys.sample_log_prob]
+                        check_finite({"current_log_prob": current_log_prob,
+                                      "behavior_log_prob": behavior_log_prob},
+                                     stage="PPO log probabilities", frames=global_step,
+                                     directory=ckpt_dir, batch=subdata)
+                        pre_loss_kl = nonnegative_sample_kl(current_log_prob, behavior_log_prob)
+                    if pre_loss_kl.item() > 1.5 * target_kl:
+                        guard_kls.append(float(pre_loss_kl))
+                        kl_guard_stops += 1
+                        stop_for_kl = True
+                        break
 
                 RPOTanhNormal.rpo_enabled = True
                 loss_vals = loss_module(subdata)
@@ -425,9 +489,28 @@ def train(cfg: DictConfig) -> None:
                     + loss_vals.get("loss_entropy", 0.0)
                 )
 
+                check_finite(dict(loss_vals.items()), stage="PPO loss", frames=global_step,
+                             directory=ckpt_dir, batch=subdata)
+                guard_kl = loss_vals.get("kl_approx", torch.tensor(0.))
+                if cfg.training.get("nonnegative_kl_guard", False):
+                    with torch.no_grad():
+                        current_log_prob = actor.get_dist(subdata).log_prob(subdata["action"])
+                        behavior_log_prob = subdata[loss_module.tensor_keys.sample_log_prob]
+                        guard_kl = nonnegative_sample_kl(current_log_prob, behavior_log_prob)
+                    check_finite({"guard_kl": guard_kl}, stage="PPO KL", frames=global_step,
+                                 directory=ckpt_dir, batch=subdata)
+                guard_kls.append(float(guard_kl))
+                if (cfg.training.get("minibatch_kl_guard", False) and target_kl is not None
+                        and guard_kl.item() > 1.5 * target_kl):
+                    kl_guard_stops += 1
+                    stop_for_kl = True
+                    break
+
                 loss_total.backward()
+                check_finite({str(i): p.grad for i, p in enumerate(optim_params) if p.grad is not None},
+                             stage="PPO gradients", frames=global_step, directory=ckpt_dir, batch=subdata)
                 torch.nn.utils.clip_grad_norm_(
-                    optim_params, cfg.training.max_grad_norm
+                    optim_params, cfg.training.max_grad_norm, error_if_nonfinite=True
                 )
                 optimizer.step()
                 optimizer.zero_grad(set_to_none=True)
@@ -444,6 +527,8 @@ def train(cfg: DictConfig) -> None:
                 epoch_kl += loss_vals.get("kl_approx", torch.tensor(0.0)).item()
 
             epochs_done += 1
+            if stop_for_kl:
+                break
             if target_kl is not None and (epoch_kl / n_sub) > 1.5 * target_kl:
                 break
 
@@ -463,7 +548,7 @@ def train(cfg: DictConfig) -> None:
         max_step_count = tensordict_data["step_count"].max().item()
         lr_now = optimizer.param_groups[0]["lr"]
 
-        avg_losses = {k: torch.stack(v).mean().item() for k, v in epoch_losses.items()}
+        avg_losses = {k: torch.stack(v).mean().item() for k, v in epoch_losses.items() if v}
 
         metrics = {
             "train/reward_mean": mean_reward,
@@ -473,6 +558,9 @@ def train(cfg: DictConfig) -> None:
             "train/global_step": global_step,
             "train/policy_entropy": policy_entropy,
             "train/epochs_done": epochs_done,
+            "train/minibatch_kl_guard_stops_total": kl_guard_stops,
+            "train/guard_kl_max": max(guard_kls, default=0.),
+            "train/initial_policy_kl": guard_kls[0] if guard_kls else 0.,
             "train/wall_seconds": time.monotonic() - training_started,
             "train/frames_per_second": global_step / (time.monotonic() - training_started),
             **{f"train/{k}": v for k, v in avg_losses.items()},
@@ -517,6 +605,10 @@ def train(cfg: DictConfig) -> None:
                 metrics.update(curriculum_metrics.update(plr_samples))
 
         last_metric_values.update(metrics)
+        if cfg.training.get("local_metrics", False):
+            import json
+            with (ckpt_dir / "training_metrics.jsonl").open("a") as stream:
+                stream.write(json.dumps(metrics) + "\n")
         if cfg.wandb.enabled:
             wandb.log(metrics, step=global_step)
 
@@ -531,7 +623,8 @@ def train(cfg: DictConfig) -> None:
             ckpt_path = ckpt_dir / f"ppo_iter_{collect_iter}.pt"
             agent = PPOAgent(actor=actor, critic=critic, device=device,
                              obs_rms=obs_rms, context_meta=_context_meta)
-            agent.save(str(ckpt_path))
+            agent.save(str(ckpt_path), training_state=learner_state(
+                optimizer, scheduler, obs_rms, ret_normalizer, global_step, collect_iter))
             log.info("Saved checkpoint → %s", ckpt_path)
 
     pbar.close()
@@ -543,7 +636,9 @@ def train(cfg: DictConfig) -> None:
             pass  # Already closed by collector shutdown
     # ── Final save ─────────────────────────────────────────────────────
     final_path = ckpt_dir / "ppo_final.pt"
-    PPOAgent(actor=actor, critic=critic, device=device, obs_rms=obs_rms, context_meta=_context_meta).save(str(final_path))
+    PPOAgent(actor=actor, critic=critic, device=device, obs_rms=obs_rms, context_meta=_context_meta).save(
+        str(final_path), training_state=learner_state(
+            optimizer, scheduler, obs_rms, ret_normalizer, global_step, collect_iter))
     log.info("Training complete. Final model → %s", final_path)
 
     if _plr_mp_manager is not None:
@@ -573,7 +668,7 @@ def train(cfg: DictConfig) -> None:
     if experiment:
         import json
         from importlib.metadata import version
-        metadata = {"method": method, "task": cfg.env.plr.sampler_key,
+        metadata = {"method": method, "task": task_key(cfg),
                     "seed": int(cfg.seed), "stage": experiment.get("stage", "validation"),
                     "actual_frames": global_step,
                     "training_seconds": time.monotonic() - training_started,
@@ -590,21 +685,24 @@ def train(cfg: DictConfig) -> None:
         if experiment.get("final_evaluation", True):
             from AAMAS_Comp.evaluation.paper import evaluate_checkpoint
             metrics = evaluate_checkpoint(str(final_path), experiment.manifest,
-                                          cfg.env.plr.sampler_key, ckpt_dir, metadata)
+                                          task_key(cfg), ckpt_dir, metadata)
             if experiment.get("public_evaluation", False):
                 from AAMAS_Comp.evaluation.public import evaluate_public_checkpoint
                 metrics.update(evaluate_public_checkpoint(
-                    str(final_path), cfg.env.plr.sampler_key, ckpt_dir, metadata,
-                    episodes_per_level=int(experiment.get("public_episodes", 100))))
+                    str(final_path), task_key(cfg), ckpt_dir, metadata,
+                    episodes_per_level=int(experiment.get("public_episodes", 100)),
+                    environment_id=experiment.get("public_environment", None),
+                    notification_modes=tuple(experiment.get("notification_modes", ['full', 'change', 'none']))))
             if cfg.wandb.enabled:
                 wandb.log(metrics, step=global_step)
-        if cfg.wandb.enabled:
+        if cfg.wandb.enabled and experiment.get("log_artifact", True):
             artifact = wandb.Artifact(f"{metadata['stage']}-{cfg.env.plr.sampler_key}-{method}-seed{cfg.seed}",
                                       type="paper-run", metadata=metadata)
             for path in ckpt_dir.iterdir():
                 if path.is_file() and (path.suffix in (".json", ".jsonl", ".npz") or path == final_path):
                     artifact.add_file(str(path))
-            artifact.add_file(str(experiment.manifest), name="manifest.json")
+            if experiment.get('manifest'):
+                artifact.add_file(str(experiment.manifest), name="manifest.json")
             if (ckpt_dir/'curriculum').is_dir():
                 artifact.add_dir(str(ckpt_dir/'curriculum'), name='curriculum')
             wandb.log_artifact(artifact)

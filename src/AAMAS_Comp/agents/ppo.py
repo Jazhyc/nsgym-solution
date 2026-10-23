@@ -542,7 +542,8 @@ def make_ppo_models(
     else:
         raise ValueError(f"Unknown optimizer type: {optimizer_type}")
 
-    total_iters = cfg.collector.total_frames // cfg.collector.frames_per_batch
+    decay_frames = cfg.training.get("lr_decay_frames", cfg.collector.total_frames)
+    total_iters = int(decay_frames) // cfg.collector.frames_per_batch
     scheduler = torch.optim.lr_scheduler.LinearLR(
         optimizer,
         start_factor=1.0,
@@ -650,7 +651,7 @@ class PPOAgent(ModelFreeAgent):
         obs_rms = checkpoint.get("obs_rms", None)
         return cls(actor=actor, device=device, deterministic=deterministic, obs_rms=obs_rms)
 
-    def save(self, path: str) -> None:
+    def save(self, path: str, training_state: dict | None = None) -> None:
         """Persist the actor (and obs normalisation stats) so it can be loaded later."""
         ckpt: dict[str, Any] = {"actor": self.actor}
         if self.critic is not None:
@@ -659,7 +660,13 @@ class PPOAgent(ModelFreeAgent):
             ckpt["obs_rms"] = {"mean": self._obs_mean.cpu(), "std": self._obs_std.cpu()}
         if self.context_meta:
             ckpt["context_meta"] = self.context_meta
-        torch.save(ckpt, path)
+        if training_state is not None:
+            ckpt["training_state"] = training_state
+        from pathlib import Path
+        target = Path(path)
+        temporary = target.with_name(target.name + ".tmp")
+        torch.save(ckpt, temporary)
+        temporary.replace(target)
 
     def set_seed(self, seed: int) -> None:
         torch.manual_seed(seed)

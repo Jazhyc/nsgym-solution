@@ -18,4 +18,16 @@ register(id="ExampleNSAnt-v0",
          order_enforce=False
          )
 
+register(id="ExampleNSAnt-v1",
+         entry_point="AAMAS_Comp.examples.environments.nsAnt_corrected:make_env",
+         disable_env_checker=True,
+         order_enforce=False
+         )
+
+register(id="ExampleNSAnt-v2",
+         entry_point="AAMAS_Comp.examples.environments.nsAnt_native_reward:make_env",
+         disable_env_checker=True,
+         order_enforce=False
+         )
+
 del register

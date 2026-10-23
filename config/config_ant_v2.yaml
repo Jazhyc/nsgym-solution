@@ -1,0 +1,25 @@
+# Explicit new protocol. Existing campaigns keep config_ant and sampler ant.
+defaults:
+  - config_ant
+  - _self_
+
+collector:
+  total_frames: 100_000_000
+  synchronous: true
+  frames_per_batch: 3072  # divisible by 24 environments and 256 minibatch size
+
+training:
+  eval_ratio: 0.1
+  minibatch_kl_guard: true
+  nonnegative_kl_guard: true
+  checkpoint_dir: checkpoints/ant_v2
+  save_interval: 3256  # approximately every 10M transitions
+
+env:
+  plr:
+    sampler_key: ant_v2
+
+agent:
+  # Match the actual historical architecture; do not introduce an untested
+  # architecture change while repairing the temporal training protocol.
+  use_layer_norm: false

@@ -96,13 +96,14 @@ def static_env(task):
 class DynamicsEnv(gym.Wrapper):
     """Randomize at reset, or apply a fixed abrupt/gradual test intervention."""
 
-    def __init__(self, task, ranges, seed=0, intervention=None, samples=None):
+    def __init__(self, task, ranges, seed=0, intervention=None, samples=None, native_ant_reward=False):
         super().__init__(static_env(task))
         self.task = task
         self.ranges = deepcopy(ranges)
         self.rng = np.random.default_rng(seed)
         self.intervention = intervention
         self.samples = samples
+        self.native_ant_reward = native_ant_reward
         self.t = 0
 
     def sample_values(self):
@@ -124,6 +125,8 @@ class DynamicsEnv(gym.Wrapper):
         return obs, info
 
     def step(self, action):
+        before_xy = (self.unwrapped.data.body(self.unwrapped._main_body).xpos[:2].copy()
+                     if self.task == 'ant' and self.native_ant_reward else None)
         changed = False
         if self.intervention is not None:
             start = self.intervention["step"]
@@ -140,5 +143,10 @@ class DynamicsEnv(gym.Wrapper):
                 if not all(np.allclose(after[k], values[k]) for k in values):
                     raise RuntimeError("Simulator did not apply the requested intervention")
         obs, reward, terminated, truncated, info = self.env.step(action)
+        if before_xy is not None:
+            ant = self.unwrapped
+            velocity = (ant.data.body(ant._main_body).xpos[:2] - before_xy) / ant.dt
+            reward, components = ant._get_rew(velocity[0], action)
+            info.update(components, x_velocity=float(velocity[0]), y_velocity=float(velocity[1]))
         self.t += 1
         return obs, reward, terminated, truncated, {**info, "verified_change": changed}
