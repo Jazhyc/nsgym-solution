@@ -12,6 +12,9 @@ training:
   eval_ratio: 0.1
   minibatch_kl_guard: true
   nonnegative_kl_guard: true
+  # Guard the candidate update as well as the policy before the next update.
+  # Frozen cluster releases retain their original configuration and code.
+  post_step_kl_guard: true
   checkpoint_dir: checkpoints/ant_v2
   save_interval: 3256  # approximately every 10M transitions
 

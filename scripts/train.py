@@ -57,7 +57,7 @@ from torchrl.envs import ParallelEnv
 
 from AAMAS_Comp.agents.ppo import PPOAgent, make_ppo_models, RPOTanhNormal
 from AAMAS_Comp.agents.recovery import check_finite, learner_state, restore_learner, validate_models
-from AAMAS_Comp.agents.policy_checks import nonnegative_sample_kl
+from AAMAS_Comp.agents.policy_checks import nonnegative_sample_kl, guarded_optimizer_step
 from AAMAS_Comp.envs.wrappers import RunningMeanStd, RewardNormalizer
 from AAMAS_Comp.envs.torchrl_factory import (
     initialize_obs_norm,
@@ -373,6 +373,9 @@ def train(cfg: DictConfig) -> None:
             raise ValueError("Complete-episode diagnostics use GAE, not V-trace")
 
     kl_guard_stops = 0
+    post_step_kl_rejections = 0
+    post_step_kl_backtracks = 0
+    zero_update_batches = 0
     for collect_iter, tensordict_data in enumerate(collector, start=resume_iteration + 1):
         batch_frames = tensordict_data.numel()
         global_step += batch_frames
@@ -451,6 +454,19 @@ def train(cfg: DictConfig) -> None:
 
         stop_for_kl = False
         guard_kls = []
+        optimizer_steps = 0
+        minimum_step_scale = 1.0
+        post_step_kls = []
+        post_step_guard = bool(cfg.training.get('post_step_kl_guard', False))
+        if post_step_guard and (not cfg.training.get('nonnegative_kl_guard', False)
+                                or target_kl is None):
+            raise ValueError('Post-update guard requires nonnegative KL and target_kl')
+
+        def measure_batch_kl():
+            current = actor.get_dist(data_view).log_prob(data_view['action'])
+            behavior = data_view[loss_module.tensor_keys.sample_log_prob]
+            return nonnegative_sample_kl(current, behavior)
+
         for _epoch in range(cfg.training.num_epochs):
             perm = torch.randperm(data_view.batch_size[0], device=device)
             epoch_kl = 0.0
@@ -512,8 +528,22 @@ def train(cfg: DictConfig) -> None:
                 torch.nn.utils.clip_grad_norm_(
                     optim_params, cfg.training.max_grad_norm, error_if_nonfinite=True
                 )
-                optimizer.step()
+                if post_step_guard:
+                    update = guarded_optimizer_step(
+                        optimizer, optim_params, measure_batch_kl, 1.5 * target_kl)
+                    post_step_kl_backtracks += update.attempts - 1
+                    if not update.accepted:
+                        post_step_kl_rejections += 1
+                        kl_guard_stops += 1
+                        optimizer.zero_grad(set_to_none=True)
+                        stop_for_kl = True
+                        break
+                    minimum_step_scale = min(minimum_step_scale, update.lr_scale)
+                    post_step_kls.append(update.kl)
+                else:
+                    optimizer.step()
                 optimizer.zero_grad(set_to_none=True)
+                optimizer_steps += 1
 
                 if cbp is not None:
                     cbp.step(global_step)
@@ -540,6 +570,16 @@ def train(cfg: DictConfig) -> None:
             # Discrete:   dist is a Categorical with no base_dist
             inner = getattr(dist, "base_dist", dist)
             policy_entropy = inner.entropy().mean().item()
+            policy_diagnostics = {}
+            if hasattr(dist, 'loc') and hasattr(dist, 'scale'):
+                policy_diagnostics = {
+                    'train/gaussian_loc_abs_max': float(dist.loc.abs().max()),
+                    'train/gaussian_scale_min': float(dist.scale.min()),
+                    'train/action_saturation_fraction': float((data_view['action'].abs() >= 1-1e-6).float().mean()),
+                    'train/action_log_prob_min': float(data_view[loss_module.tensor_keys.sample_log_prob].min()),
+                }
+
+        zero_update_batches = zero_update_batches + 1 if optimizer_steps == 0 else 0
 
         scheduler.step()
 
@@ -558,6 +598,12 @@ def train(cfg: DictConfig) -> None:
             "train/global_step": global_step,
             "train/policy_entropy": policy_entropy,
             "train/epochs_done": epochs_done,
+            "train/optimizer_steps": optimizer_steps,
+            "train/post_step_kl_backtracks_total": post_step_kl_backtracks,
+            "train/post_step_kl_rejections_total": post_step_kl_rejections,
+            "train/minimum_step_scale": minimum_step_scale,
+            "train/post_step_kl_max": max(post_step_kls, default=0.),
+            'train/zero_update_batches': zero_update_batches,
             "train/minibatch_kl_guard_stops_total": kl_guard_stops,
             "train/guard_kl_max": max(guard_kls, default=0.),
             "train/initial_policy_kl": guard_kls[0] if guard_kls else 0.,
@@ -565,6 +611,7 @@ def train(cfg: DictConfig) -> None:
             "train/frames_per_second": global_step / (time.monotonic() - training_started),
             **{f"train/{k}": v for k, v in avg_losses.items()},
             **episode_metrics,
+            **policy_diagnostics,
         }
         if plr_enabled:
             metrics["plr/feedback_sent_total"] = feedback_sent
@@ -611,6 +658,19 @@ def train(cfg: DictConfig) -> None:
                 stream.write(json.dumps(metrics) + "\n")
         if cfg.wandb.enabled:
             wandb.log(metrics, step=global_step)
+
+        zero_update_limit = cfg.training.get('max_zero_update_batches', None)
+        if zero_update_limit is not None and zero_update_batches >= int(zero_update_limit):
+            import json
+            failure = {'reason': 'No optimizer steps in consecutive collected batches',
+                       'global_step': global_step, 'consecutive_batches': zero_update_batches,
+                       'initial_policy_kl': metrics['train/initial_policy_kl'], **policy_diagnostics}
+            (ckpt_dir/'training_failure.json').write_text(json.dumps(failure, indent=2))
+            PPOAgent(actor=actor, critic=critic, device=device, obs_rms=obs_rms,
+                     context_meta=_context_meta).save(str(ckpt_dir/'ppo_failure.pt'),
+                     training_state=learner_state(optimizer, scheduler, obs_rms,
+                                                 ret_normalizer, global_step, collect_iter))
+            raise RuntimeError(f"Training stalled at frame {global_step}: {zero_update_batches} batches without updates")
 
         pbar.update(batch_frames)
         postfix = dict(reward=f"{mean_reward:.3f}")
